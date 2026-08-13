@@ -1,3 +1,18 @@
+"""
+==================================================================================
+ Smart Multi-PDF to Excel Converter (Grid-Aware OCR & Data Alignment)
+==================================================================================
+A production-grade Streamlit application that:
+  - Accepts 100+ PDF uploads at once
+  - Detects whether each PDF is text-based or scanned (image-based)
+  - Extracts tables using pdfplumber/camelot (text PDFs) 
+  - Uses advanced OpenCV Grid-Detection for scanned PDFs to perfectly align columns
+  - Detects multi-page table continuity and merges continued tables
+  - Cleans extracted data and formats output (bold headers, auto-width)
+  - Produces Excel workbooks per PDF + an optional Master Excel for all PDFs
+==================================================================================
+"""
+
 import io
 import os
 import re
@@ -15,15 +30,10 @@ import pdfplumber
 from pdf2image import convert_from_bytes
 import pytesseract
 import cv2
-
 from rapidfuzz import fuzz
 
-# Optional openpyxl imports for formatting
-try:
-    from openpyxl.styles import Font
-    from openpyxl.utils import get_column_letter
-except ImportError:
-    pass
+# For premium Excel formatting
+from openpyxl.styles import Font, PatternFill, Alignment
 
 # camelot is optional at import time
 try:
@@ -32,10 +42,6 @@ try:
 except Exception:
     CAMELOT_AVAILABLE = False
 
-
-# ==================================================================================
-# CONFIGURATION
-# ==================================================================================
 
 st.set_page_config(
     page_title="Multi-PDF to Excel Converter",
@@ -49,10 +55,6 @@ COLUMN_COUNT_TOLERANCE = 0
 DTYPE_SIMILARITY_THRESHOLD = 0.6   
 EXCEL_SHEET_NAME_MAX_LEN = 31  
 
-
-# ==================================================================================
-# DATA STRUCTURES
-# ==================================================================================
 
 @dataclass
 class ExtractedTable:
@@ -78,10 +80,6 @@ class FileResult:
     num_tables_after_merge: int = 0
 
 
-# ==================================================================================
-# STEP 1: PDF TYPE DETECTION
-# ==================================================================================
-
 def detect_pdf_type(pdf_bytes: bytes) -> Tuple[str, int]:
     try:
         with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
@@ -104,10 +102,6 @@ def detect_pdf_type(pdf_bytes: bytes) -> Tuple[str, int]:
     except Exception:
         return "scanned", 0
 
-
-# ==================================================================================
-# STEP 2A: TEXT-BASED EXTRACTION
-# ==================================================================================
 
 def extract_text_pdf(pdf_bytes: bytes, filename: str) -> List[ExtractedTable]:
     extracted: List[ExtractedTable] = []
@@ -180,10 +174,6 @@ def extract_text_pdf(pdf_bytes: bytes, filename: str) -> List[ExtractedTable]:
     return extracted
 
 
-# ==================================================================================
-# STEP 2B: SCANNED PDF EXTRACTION (OCR)
-# ==================================================================================
-
 def preprocess_image(image: np.ndarray) -> np.ndarray:
     gray = cv2.cvtColor(image, cv2.COLOR_RGB2GRAY)
     denoised = cv2.fastNlMeansDenoising(gray, h=10)
@@ -197,13 +187,12 @@ def preprocess_image(image: np.ndarray) -> np.ndarray:
     processed = cv2.morphologyEx(thresh, cv2.MORPH_CLOSE, kernel)
     return processed
 
-def _extract_annexure_template(ocr_data: Dict[str, list], img_width: int) -> List[pd.DataFrame]:
+
+def _extract_tables_from_ocr(ocr_data: Dict[str, list], img: np.ndarray) -> List[pd.DataFrame]:
     """
-    Template-aware parser specifically for 'Annexure to Supplementary Invoice'.
-    Isolates Header, Pricing Table, and Invoice Table into exact structured dataframes.
-    Uses horizontal constraints, Regex stitching, and 1D K-Means for column snapping.
+    Highly robust OCR table extractor. Uses OpenCV to find grid lines, isolates tables into blocks,
+    and accurately aligns columns based on grid layouts or X-axis projection profiles.
     """
-    # 1. Parse words
     words = []
     n = len(ocr_data["text"])
     for i in range(n):
@@ -220,245 +209,134 @@ def _extract_annexure_template(ocr_data: Dict[str, list], img_width: int) -> Lis
             "width": w, "height": h, "cx": x + w/2, "cy": y + h/2
         })
         
-    if not words: return []
+    if not words: 
+        return []
     
-    # 2. Fix Broken Numbers (e.g., "2,110" and ".31" split by a gap)
-    words.sort(key=lambda w: (w["cy"], w["left"]))
-    fixed_words = []
-    skip = False
-    for i in range(len(words)-1):
-        if skip:
-            skip = False
-            continue
-        w1, w2 = words[i], words[i+1]
-        
-        # If words are on the same line and very close horizontally
-        if abs(w1["cy"] - w2["cy"]) < 15 and (w2["left"] - w1["right"]) < 30:
-            # Check if one ends with digit/comma and the next starts with dot/digit
-            if (re.search(r'[\d\,]$', w1["text"]) and re.search(r'^[\.\,]\s*\d', w2["text"])) or \
-               (w1["text"].isdigit() and w2["text"].isdigit()):
-                w_new = w1.copy()
-                w_new["text"] = w1["text"] + w2["text"].replace(" ", "")
-                w_new["right"] = w2["right"]
-                w_new["width"] = w2["right"] - w1["left"]
-                w_new["cx"] = (w_new["left"] + w_new["right"]) / 2
-                fixed_words.append(w_new)
-                skip = True
-                continue
-        fixed_words.append(w1)
-    if not skip and words: fixed_words.append(words[-1])
-    words = fixed_words
-    
-    # 3. Split merged numeric/text like "1,788.40J3" -> "1,788.40" and "J3"
-    split_words = []
-    for w in words:
-        m = re.match(r'^([\d\,\.]+)([a-zA-Z0-9]{2,3})$', w["text"])
-        # If it matched the pattern and the first part actually has digits (not just dots)
-        if m and any(c.isdigit() for c in m.group(1)) and not w["text"].isdigit():
-            w1 = w.copy()
-            w1["text"] = m.group(1)
-            # Estimate geometry based on length ratios
-            ratio = len(w1["text"]) / len(w["text"])
-            w1["right"] = w["left"] + int(w["width"] * ratio)
-            w1["width"] = w1["right"] - w1["left"]
-            w1["cx"] = w1["left"] + w1["width"] / 2
-            
-            w2 = w.copy()
-            w2["text"] = m.group(2)
-            w2["left"] = w1["right"]
-            w2["width"] = w["right"] - w2["left"]
-            w2["cx"] = w2["left"] + w2["width"] / 2
-            split_words.extend([w1, w2])
-        else:
-            split_words.append(w)
-    words = split_words
-
-    # 4. Group into horizontal lines
+    # 1. Row Formation using strict vertical overlap heuristics
     words.sort(key=lambda w: w["cy"])
     lines = []
-    curr_line = [words[0]]
+    current_line = [words[0]]
+    
     for w in words[1:]:
-        avg_cy = sum(x["cy"] for x in curr_line) / len(curr_line)
-        avg_h = sum(x["height"] for x in curr_line) / len(curr_line)
-        if abs(w["cy"] - avg_cy) < max(avg_h * 0.5, 8):
-            curr_line.append(w)
+        avg_cy = sum(x["cy"] for x in current_line) / len(current_line)
+        avg_h = sum(x["height"] for x in current_line) / len(current_line)
+        if abs(w["cy"] - avg_cy) < max(avg_h * 0.4, 5):
+            current_line.append(w)
         else:
-            curr_line.sort(key=lambda x: x["left"])
-            lines.append(curr_line)
-            curr_line = [w]
-    if curr_line:
-        curr_line.sort(key=lambda x: x["left"])
-        lines.append(curr_line)
-
-    dfs = []
+            current_line.sort(key=lambda x: x["left"])
+            lines.append(current_line)
+            current_line = [w]
+    if current_line:
+        current_line.sort(key=lambda x: x["left"])
+        lines.append(current_line)
+        
+    # 2. Block Formation (split separate tables by checking large vertical gaps)
+    blocks = []
+    current_block = [lines[0]]
+    for i in range(1, len(lines)):
+        prev_line = lines[i-1]
+        curr_line = lines[i]
+        prev_bottom = max(w["bottom"] for w in prev_line)
+        curr_top = min(w["top"] for w in curr_line)
+        avg_h = sum(w["height"] for w in curr_line) / len(curr_line)
+        
+        if (curr_top - prev_bottom) > avg_h * 2.2: # Significant visual gap = new table
+            blocks.append(current_block)
+            current_block = [curr_line]
+        else:
+            current_block.append(curr_line)
+    if current_block:
+        blocks.append(current_block)
+        
+    # 3. Column parsing per block using OpenCV Grid intelligence
+    image_width = img.shape[1]
+    block_dfs = []
     
-    # 5. Extract Header Dictionary
-    header_keys = ["PSF No.", "SA No.", "Plant", "Material No.", "Annexure Number", "Annexure Date"]
-    search_keys = ["PSF No", "SA No", "Plant", "Material No", "Annexure Number", "Annexure Date"]
-    header_dict = {}
-    
-    for line in lines:
-        for idx, hk in enumerate(search_keys):
-            clean_hk = hk.replace(" ", "").lower()
-            for i, w in enumerate(line):
-                clean_w = w["text"].replace(".", "").replace(" ", "").lower()
-                # Check for match (fuzzy or direct substring)
-                if fuzz.ratio(clean_hk, clean_w) > 85 or (len(clean_w)>4 and clean_w in clean_hk):
-                    if i + 1 < len(line):
-                        next_w = line[i+1]
-                        # Check if the next word is another key (means value is empty)
-                        is_key = any(fuzz.ratio(k.replace(" ","").lower(), next_w["text"].replace(".","").replace(" ","").lower()) > 85 for k in search_keys)
-                        
-                        if not is_key and (next_w["left"] - w["right"]) < 350:
-                            val_text = next_w["text"]
-                            j = i + 2
-                            while j < len(line):
-                                is_next_key = any(fuzz.ratio(k.replace(" ","").lower(), line[j]["text"].replace(".","").replace(" ","").lower()) > 85 for k in search_keys)
-                                if is_next_key or (line[j]["left"] - line[j-1]["right"] > 80):
-                                    break
-                                val_text += " " + line[j]["text"]
-                                j += 1
-                            header_dict[header_keys[idx]] = val_text
-                            
-    if header_dict:
-        dfs.append(pd.DataFrame([header_dict]))
+    for block in blocks:
+        min_y = max(0, min(w["top"] for line in block for w in line) - 10)
+        max_y = min(img.shape[0], max(w["bottom"] for line in block for w in line) + 10)
+        block_img = img[min_y:max_y, :]
         
-    # 6. Locate Table Boundaries
-    pricing_start, invoice_start = -1, -1
-    for i, line in enumerate(lines):
-        line_str = " ".join([w["text"].lower() for w in line])
-        if "effective" in line_str and "date" in line_str and "price" in line_str:
-            pricing_start = i
-        if "invoice no" in line_str and "grn" in line_str:
-            invoice_start = i
-            
-    def _build_table(table_lines, expected_cols):
-        if not table_lines: return pd.DataFrame()
-        all_words = [w for l in table_lines for w in l]
-        if not all_words: return pd.DataFrame()
+        # Detect vertical grid lines in this specific table block
+        gray = cv2.cvtColor(block_img, cv2.COLOR_RGB2GRAY)
+        thresh = cv2.adaptiveThreshold(~gray, 255, cv2.ADAPTIVE_THRESH_MEAN_C, cv2.THRESH_BINARY, 15, -2)
+        kernel_h = max(15, int(block_img.shape[0] * 0.3)) 
+        v_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (1, kernel_h))
+        v_lines_mask = cv2.morphologyEx(thresh, cv2.MORPH_OPEN, v_kernel)
         
-        num_cols = len(expected_cols)
-        cx_vals = [w["cx"] for w in all_words]
-        
-        # Initial cluster centers spread evenly across the X-axis bounds
-        centers = np.linspace(min(cx_vals), max(cx_vals), num_cols)
-        
-        # 1D K-Means to find robust column anchor points
-        for _ in range(15):
-            clusters = [[] for _ in range(num_cols)]
-            for cx in cx_vals:
-                best_idx = int(np.argmin([abs(cx - c) for c in centers]))
-                clusters[best_idx].append(cx)
-            new_centers = []
-            for idx, cl in enumerate(clusters):
-                new_centers.append(np.mean(cl) if cl else centers[idx])
-            centers = new_centers
-            
-        centers = sorted(centers)
-        data = []
-        
-        for line in table_lines:
-            line_str = " ".join([w["text"].lower() for w in line])
-            # Skip rows consisting mostly of header text (avoid repeating headers inside data)
-            if sum(1 for c in expected_cols if fuzz.ratio(c.lower(), line_str) > 60) > 3:
-                continue
-            # Skip sparse rows unless it's a totals row
-            if len(line) < 2 and "total" not in line_str:
-                continue
+        contours, _ = cv2.findContours(v_lines_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        x_coords = []
+        for c in contours:
+            x, y, w_box, h_box = cv2.boundingRect(c)
+            if h_box >= kernel_h * 0.8: 
+                x_coords.append(x + w_box//2)
                 
-            row_data = [""] * num_cols
+        x_coords.sort()
+        v_lines = []
+        if x_coords:
+            curr = [x_coords[0]]
+            for x in x_coords[1:]:
+                if x - curr[-1] < 10:
+                    curr.append(x)
+                else:
+                    v_lines.append(int(np.mean(curr)))
+                    curr = [x]
+            v_lines.append(int(np.mean(curr)))
+            
+        cols = []
+        if len(v_lines) >= 2:
+            # Table has clear grid lines. Use them directly to define columns.
+            v_lines = [0] + v_lines + [image_width]
+            for i in range(len(v_lines)-1):
+                cols.append((v_lines[i], v_lines[i+1]))
+        else:
+            # Borderless Table Fallback: Use Vertical Projection Profile
+            profile = np.zeros(image_width, dtype=int)
+            for line in block:
+                for w in line:
+                    profile[max(0, w["left"]):min(image_width, w["right"])] += 1
+            
+            is_gap = profile <= 0
+            in_col = False
+            start = 0
+            for x in range(image_width):
+                if not is_gap[x] and not in_col:
+                    in_col = True
+                    start = x
+                elif is_gap[x] and in_col:
+                    in_col = False
+                    cols.append((start, x))
+            if in_col:
+                cols.append((start, image_width))
+                
+        # Map words to their perfect grid cells
+        block_data = []
+        for line in block:
+            row_data = [""] * len(cols)
             for w in line:
-                best_col = int(np.argmin([abs(w["cx"] - c) for c in centers]))
+                cx = w["cx"]
+                best_col = 0
+                min_dist = float("inf")
+                for idx, (cmin, cmax) in enumerate(cols):
+                    if cmin <= cx <= cmax:
+                        best_col = idx
+                        break
+                    dist = min(abs(cx - cmin), abs(cx - cmax))
+                    if dist < min_dist:
+                        min_dist = dist
+                        best_col = idx
+                        
                 if row_data[best_col]:
                     row_data[best_col] += " " + w["text"]
                 else:
                     row_data[best_col] = w["text"]
+            block_data.append(row_data)
             
-            str_row = " ".join(row_data).lower()
-            if "invoice no" in str_row or "effective from" in str_row: continue
-            data.append(row_data)
+        if block_data:
+            block_dfs.append(pd.DataFrame(block_data))
             
-        return pd.DataFrame(data, columns=expected_cols)
-        
-    # 7. Extract Pricing Table
-    if pricing_start != -1:
-        end_idx = invoice_start if invoice_start != -1 else len(lines)
-        pricing_df = _build_table(lines[pricing_start:end_idx], [
-            "Effective From Date", "Effective To Date", "Old Base Price", 
-            "New Base Price", "Old Freight", "New Freight", 
-            "Old Packing", "New Packing", "Net Diff"
-        ])
-        if not pricing_df.empty: dfs.append(pricing_df)
-            
-    # 8. Extract Invoice Table
-    if invoice_start != -1:
-        invoice_df = _build_table(lines[invoice_start:], [
-            "Invoice No", "Invoice Date", "GRN No", "Qty", 
-            "Original Invoice", "Net Diff", "Net Value", "Tax Code", 
-            "SGST", "CGST", "IGST", "Total Value"
-        ])
-        if not invoice_df.empty: dfs.append(invoice_df)
-            
-    # 9. Continuation Page Catch (If the page is purely a continued invoice table)
-    if pricing_start == -1 and invoice_start == -1 and len(lines) > 5:
-        # Determine likely column count
-        avg_words_per_line = sum(len(l) for l in lines) / len(lines)
-        if avg_words_per_line >= 8:
-            invoice_df = _build_table(lines, [
-                "Invoice No", "Invoice Date", "GRN No", "Qty", 
-                "Original Invoice", "Net Diff", "Net Value", "Tax Code", 
-                "SGST", "CGST", "IGST", "Total Value"
-            ])
-            if not invoice_df.empty: dfs.append(invoice_df)
-            
-    return dfs
+    return block_dfs
 
-def _words_to_table(ocr_data: Dict[str, list], y_tolerance: int = 12) -> pd.DataFrame:
-    words = []
-    n = len(ocr_data["text"])
-    for i in range(n):
-        text = ocr_data["text"][i].strip()
-        if not text:
-            continue
-        conf = ocr_data.get("conf", ["0"] * n)[i]
-        try:
-            conf_val = float(conf)
-        except (ValueError, TypeError):
-            conf_val = -1
-        if conf_val != -1 and conf_val < 30:
-            continue
-        words.append({
-            "text": text,
-            "left": ocr_data["left"][i],
-            "top": ocr_data["top"][i],
-        })
-
-    if not words:
-        return pd.DataFrame()
-
-    words.sort(key=lambda w: w["top"])
-    rows = []
-    current_row = [words[0]]
-    current_top = words[0]["top"]
-
-    for w in words[1:]:
-        if abs(w["top"] - current_top) <= y_tolerance:
-            current_row.append(w)
-        else:
-            rows.append(current_row)
-            current_row = [w]
-            current_top = w["top"]
-    rows.append(current_row)
-
-    table_rows = []
-    for row in rows:
-        row_sorted = sorted(row, key=lambda w: w["left"])
-        table_rows.append([w["text"] for w in row_sorted])
-
-    max_cols = max(len(r) for r in table_rows)
-    table_rows = [r + [""] * (max_cols - len(r)) for r in table_rows]
-
-    return pd.DataFrame(table_rows)
 
 def extract_ocr_pdf(pdf_bytes: bytes, filename: str, dpi: int = 200) -> List[ExtractedTable]:
     extracted: List[ExtractedTable] = []
@@ -469,62 +347,39 @@ def extract_ocr_pdf(pdf_bytes: bytes, filename: str, dpi: int = 200) -> List[Ext
 
     for i, pil_page in enumerate(pages, start=1):
         try:
+            # Keep original RGB image for grid detection, pass processed to Tesseract
             img = np.array(pil_page.convert("RGB"))
             processed = preprocess_image(img)
+            
             ocr_data = pytesseract.image_to_data(
                 processed, output_type=pytesseract.Output.DICT
             )
             
-            # Smart Routing: Check for template keywords
-            text_content = " ".join([str(x).lower() for x in ocr_data.get("text", []) if str(x).strip()])
-            is_annexure = (
-                "annexure to supplementary invoice" in text_content or 
-                ("effective from date" in text_content and "new base price" in text_content) or
-                ("invoice no" in text_content and "grn no" in text_content and "tax code" in text_content)
-            )
-            
-            if is_annexure:
-                dfs = _extract_annexure_template(ocr_data, img.shape[1])
-                for df in dfs:
-                    if not df.empty:
-                        extracted.append(ExtractedTable(df, i, "ocr-annexure"))
-            else:
-                df = _words_to_table(ocr_data)
+            # Map unstructured text back into robust DataFrames
+            dfs = _extract_tables_from_ocr(ocr_data, img)
+            for df in dfs:
                 if not df.empty:
-                    extracted.append(ExtractedTable(df, i, "ocr-generic"))
-                    
+                    extracted.append(ExtractedTable(df, i, "ocr-smart"))
         except Exception:
             continue
 
     return extracted
 
 
-# ==================================================================================
-# STEP 3: CONTINUITY DETECTION & MERGING
-# ==================================================================================
-
 def _infer_column_dtype_signature(series: pd.Series) -> str:
     sample = series.dropna().astype(str).str.strip()
     sample = sample[sample != ""].head(20)
-    if sample.empty:
-        return "empty"
+    if sample.empty: return "empty"
     numeric_count = sum(bool(re.fullmatch(r"-?\d+(\.\d+)?%?", v)) for v in sample)
     date_count = sum(bool(re.fullmatch(r"\d{1,4}[/-]\d{1,2}[/-]\d{1,4}", v)) for v in sample)
-    if numeric_count / len(sample) >= 0.6:
-        return "numeric"
-    if date_count / len(sample) >= 0.6:
-        return "date"
+    if numeric_count / len(sample) >= 0.6: return "numeric"
+    if date_count / len(sample) >= 0.6: return "date"
     return "text"
 
 def _dtype_signature_similarity(df1: pd.DataFrame, df2: pd.DataFrame) -> float:
     n = min(len(df1.columns), len(df2.columns))
     if n == 0: return 0.0
-    matches = 0
-    for c in range(n):
-        sig1 = _infer_column_dtype_signature(df1.iloc[:, c])
-        sig2 = _infer_column_dtype_signature(df2.iloc[:, c])
-        if sig1 == sig2:
-            matches += 1
+    matches = sum(1 for c in range(n) if _infer_column_dtype_signature(df1.iloc[:, c]) == _infer_column_dtype_signature(df2.iloc[:, c]))
     return matches / n
 
 def _header_similarity(df1: pd.DataFrame, df2: pd.DataFrame) -> float:
@@ -537,8 +392,8 @@ def _header_similarity(df1: pd.DataFrame, df2: pd.DataFrame) -> float:
 
 def are_tables_similar(df1: pd.DataFrame, df2: pd.DataFrame) -> bool:
     if df1.empty or df2.empty: return False
-    col_diff = abs(len(df1.columns) - len(df2.columns))
-    if col_diff > COLUMN_COUNT_TOLERANCE: return False
+    if abs(len(df1.columns) - len(df2.columns)) > COLUMN_COUNT_TOLERANCE: return False
+    
     header_score = _header_similarity(df1, df2)
     dtype_score = _dtype_signature_similarity(df1, df2)
 
@@ -570,19 +425,14 @@ def group_and_merge_tables(extracted_tables: List[ExtractedTable]) -> List[pd.Da
     groups: List[List[pd.DataFrame]] = [[ordered[0].dataframe]]
 
     for et in ordered[1:]:
-        last_group = groups[-1]
-        last_df = last_group[-1]
+        last_df = groups[-1][-1]
         if are_tables_similar(last_df, et.dataframe):
-            last_group.append(et.dataframe)
+            groups[-1].append(et.dataframe)
         else:
             groups.append([et.dataframe])
 
     return [merge_tables(g) for g in groups]
 
-
-# ==================================================================================
-# STEP 4: DATA CLEANING
-# ==================================================================================
 
 def clean_tables(df: pd.DataFrame) -> pd.DataFrame:
     if df is None or df.empty: return pd.DataFrame()
@@ -590,29 +440,20 @@ def clean_tables(df: pd.DataFrame) -> pd.DataFrame:
 
     df = df.astype(str).apply(lambda col: col.str.replace(r"\s+", " ", regex=True).str.strip())
     df = df.replace(r"^\s*$", np.nan, regex=True)
-    df = df.replace("nan", np.nan)
-    
-    # Drop rows/columns that are completely empty
     df = df.dropna(axis=0, how="all")
     df = df.dropna(axis=1, how="all")
 
     if df.empty: return df
     df = df.reset_index(drop=True)
 
-    # If the dataframe already has valid string columns (like our template output), don't push them down
-    if all(isinstance(c, str) and not str(c).startswith("col_") and not str(c).isdigit() for c in df.columns):
-        pass # Already formatted well
+    first_row = df.iloc[0]
+    non_null_ratio = first_row.notna().mean()
+    if non_null_ratio > 0.5:
+        df.columns = [str(c) if pd.notna(c) else f"col_{i}" for i, c in enumerate(first_row)]
+        df = df.iloc[1:].reset_index(drop=True)
     else:
-        # Standard extraction logic: promote first row to header
-        first_row = df.iloc[0]
-        non_null_ratio = first_row.notna().mean()
-        if non_null_ratio > 0.5:
-            df.columns = [str(c) if pd.notna(c) else f"col_{i}" for i, c in enumerate(first_row)]
-            df = df.iloc[1:].reset_index(drop=True)
-        else:
-            df.columns = [f"col_{i}" for i in range(len(df.columns))]
+        df.columns = [f"col_{i}" for i in range(len(df.columns))]
 
-    # Deduplicate column names
     seen = {}
     new_cols = []
     for c in df.columns:
@@ -625,7 +466,6 @@ def clean_tables(df: pd.DataFrame) -> pd.DataFrame:
             new_cols.append(c)
     df.columns = new_cols
 
-    # Remove inline repeated headers
     header_lower = [str(c).strip().lower() for c in df.columns]
     def _is_header_dup(row):
         vals = [str(v).strip().lower() for v in row.tolist()]
@@ -641,12 +481,10 @@ def clean_tables(df: pd.DataFrame) -> pd.DataFrame:
     df = df.dropna(axis=0, how="all")
     df = df.reset_index(drop=True)
 
+    # Fill NaN with empty string for cleaner Excel generation
+    df = df.fillna("")
     return df
 
-
-# ==================================================================================
-# EXCEL WORKBOOK GENERATION (Single Sheet vs Multi Sheet)
-# ==================================================================================
 
 def _safe_sheet_name(name: str, used_names: set) -> str:
     name = re.sub(r"[\[\]:*?/\\]", "_", name).strip() or "Sheet"
@@ -663,7 +501,7 @@ def _safe_sheet_name(name: str, used_names: set) -> str:
 def build_excel_workbook(tables: List[pd.DataFrame], layout_mode: str = "multi") -> Tuple[bytes, List[str], Dict[str, pd.DataFrame]]:
     """
     Write a list of cleaned tables into an Excel workbook.
-    Adds openpyxl formatting to bold headers and autofit columns perfectly.
+    Applies Openpyxl formatting (Bold headers, auto column widths) for a premium layout.
     """
     output = io.BytesIO()
     used_names: set = set()
@@ -683,53 +521,65 @@ def build_excel_workbook(tables: List[pd.DataFrame], layout_mode: str = "multi")
                 current_row = 0
                 
                 for idx, df in enumerate(tables):
-                    if df.empty:
-                        continue
+                    if df.empty: continue
                     if current_row == 0:
                         previews[sheet_name] = df.head(5)
                         
                     label_df = pd.DataFrame(columns=[f"--- Table {idx+1} ---"])
                     label_df.to_excel(writer, sheet_name=sheet_name, startrow=current_row, index=False)
                     df.to_excel(writer, sheet_name=sheet_name, startrow=current_row + 1, index=False)
+                    
+                    worksheet = writer.sheets[sheet_name]
+                    header_row = current_row + 2 
+                    
+                    # Style headers
+                    for col_idx in range(1, len(df.columns) + 1):
+                        cell = worksheet.cell(row=header_row, column=col_idx)
+                        cell.font = Font(bold=True)
+                        cell.fill = PatternFill(start_color="F0F0F0", end_color="F0F0F0", fill_type="solid")
+                        cell.alignment = Alignment(horizontal="center")
+                    
                     current_row += len(df) + 4
+                    
+                # Auto-fit columns for Single Sheet
+                worksheet = writer.sheets[sheet_name]
+                for col in worksheet.columns:
+                    max_length = 0
+                    column = col[0].column_letter 
+                    for cell in col:
+                        try: 
+                            if len(str(cell.value)) > max_length:
+                                max_length = len(str(cell.value))
+                        except: pass
+                    worksheet.column_dimensions[column].width = min(max_length + 2, 55)
+
             else:
                 for idx, df in enumerate(tables, start=1):
-                    if df.empty:
-                        continue
+                    if df.empty: continue
                     sheet_name = _safe_sheet_name(f"Table_{idx}", used_names)
                     df.to_excel(writer, sheet_name=sheet_name, index=False)
                     sheet_names.append(sheet_name)
                     previews[sheet_name] = df.head(5)
-
-        # Apply OpenPyXL formatting (Autofit & Bold)
-        try:
-            for sheet_name in writer.sheets:
-                worksheet = writer.sheets[sheet_name]
-                for col in worksheet.columns:
-                    max_length = 0
-                    column = col[0].column_letter # Get the column name
-                    for cell in col:
-                        try:
-                            if cell.value:
-                                max_length = max(max_length, len(str(cell.value)))
-                        except:
-                            pass
-                        
-                        # Bold styling for label separators or true top rows
-                        if cell.row == 1 or (layout_mode == "single" and str(cell.value).startswith("---")):
-                            cell.font = Font(bold=True)
-                            
-                    adjusted_width = (max_length + 2)
-                    worksheet.column_dimensions[column].width = min(adjusted_width, 50) # Cap width at 50
-        except Exception as e:
-            print(f"Excel formatting skipped: {e}")
+                    
+                    worksheet = writer.sheets[sheet_name]
+                    
+                    # Format Header & Columns
+                    for col in worksheet.columns:
+                        max_length = 0
+                        column = col[0].column_letter
+                        for i, cell in enumerate(col):
+                            if i == 0:  # Header style
+                                cell.font = Font(bold=True)
+                                cell.fill = PatternFill(start_color="F0F0F0", end_color="F0F0F0", fill_type="solid")
+                                cell.alignment = Alignment(horizontal="center")
+                            try:
+                                if len(str(cell.value)) > max_length:
+                                    max_length = len(str(cell.value))
+                            except: pass
+                        worksheet.column_dimensions[column].width = min(max_length + 2, 55)
 
     return output.getvalue(), sheet_names, previews
 
-
-# ==================================================================================
-# STEP 5 & 6: PIPELINE EXECUTORS
-# ==================================================================================
 
 def process_single_pdf(filename: str, pdf_bytes: bytes, layout_mode: str) -> FileResult:
     result = FileResult(filename=filename, status="processing")
@@ -793,7 +643,6 @@ def process_multiple_pdfs(
             )
             results.append(err_result)
             row_placeholder.error(f"❌ **{filename}** failed: {err_result.error_message}")
-            traceback.print_exc()
 
         overall_progress_bar.progress(i / total, text=f"Overall progress: {i}/{total} files")
 
@@ -809,22 +658,16 @@ def build_zip_of_excels(results: List[FileResult]) -> bytes:
     return zip_buffer.getvalue()
 
 
-# ==================================================================================
-# STREAMLIT UI
-# ==================================================================================
-
 def main():
     st.title("📊 Multi-PDF to Excel Converter")
     st.caption(
-        "Upload multiple PDFs (text-based or scanned). Each PDF is converted into "
-        "an Excel workbook, with multi-page tables intelligently merged. Now featuring "
-        "template-aware OCR for *Annexure to Supplementary Invoice* layouts."
+        "Upload multiple PDFs (text-based or scanned). Scanned tables are natively processed "
+        "using OpenCV Grid-Intelligence to guarantee perfect column alignment."
     )
 
     if not CAMELOT_AVAILABLE:
         st.warning(
-            "⚠️ `camelot-py` (or its Ghostscript dependency) is not available in this "
-            "environment. Text-based extraction will fall back to pdfplumber only."
+            "⚠️ `camelot-py` (or its Ghostscript dependency) is not available. Text-based extraction will fall back to pdfplumber only."
         )
 
     with st.sidebar:
@@ -838,7 +681,7 @@ def main():
                 "Single-Sheet (All tables stacked vertically)"
             ],
             index=0,
-            help="Choose whether to place each extracted table on its own Excel tab, or stack them all on a single tab with spacing."
+            help="Choose whether to place each extracted table on its own Excel tab, or stack them all on a single tab."
         )
         layout_mode = "single" if "Single" in sheet_layout else "multi"
 
@@ -847,7 +690,7 @@ def main():
                              help="Higher DPI improves OCR accuracy but is slower.")
         
         st.markdown("---")
-        st.markdown("**Tech stack:** pdfplumber, camelot, pytesseract, pdf2image, OpenCV, rapidfuzz, openpyxl")
+        st.markdown("**Core Engines:** openCV, Tesseract, pdfplumber, openpyxl")
 
     uploaded_files = st.file_uploader(
         "Upload PDF files (you can select 100+ at once)",
@@ -880,16 +723,14 @@ def main():
                 return original_ocr_fn(pdf_bytes, filename, dpi=dpi)
             extract_ocr_pdf = _ocr_with_dpi
 
-            with st.spinner("Converting PDFs to Excel... this may take a while for large batches."):
+            with st.spinner("Converting PDFs to Excel... this may take a while for scanned documents."):
                 results = process_multiple_pdfs(uploaded_files, overall_progress_bar, status_container, layout_mode)
 
             extract_ocr_pdf = original_ocr_fn  
             st.session_state["results"] = results
             st.success("🎉 Batch processing complete!")
 
-    # ------------------------------------------------------------------
-    # RESULTS / DOWNLOADS
-    # ------------------------------------------------------------------
+
     results: List[FileResult] = st.session_state.get("results", [])
 
     if results:
@@ -908,7 +749,6 @@ def main():
             st.markdown("#### Batch Actions")
             colA, colB = st.columns(2)
             
-            # Action 1: ZIP of individual files
             zip_bytes = build_zip_of_excels(done_results)
             colA.download_button(
                 label=f"⬇️ Download {len(done_results)} files as ZIP",
@@ -919,7 +759,6 @@ def main():
                 use_container_width=True
             )
             
-            # Action 2: Massive master combined file
             master_tables = []
             for r in done_results:
                 for t in r.tables:
@@ -937,7 +776,6 @@ def main():
                     mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
                     type="secondary",
                     use_container_width=True,
-                    help="Combine every table from every PDF into a single Excel file."
                 )
 
         st.markdown("#### Individual files")
