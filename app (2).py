@@ -534,7 +534,7 @@ def remove_metadata_rows(df: pd.DataFrame) -> pd.DataFrame:
 
 def remove_noise_columns(df: pd.DataFrame) -> pd.DataFrame:
     """Drops columns that are fully empty, >80% empty, or contain no numeric data/meaningful text."""
-    df = df.replace(r"^\s*nan\s*$", np.nan, regex=True, flags=re.IGNORECASE)
+    df = df.replace(r"(?i)^\s*nan\s*$", np.nan, regex=True)
     df = df.replace(r"^\s*$", np.nan, regex=True)
     
     # Drop fully empty
