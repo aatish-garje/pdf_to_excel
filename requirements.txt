@@ -1,0 +1,11 @@
+streamlit
+pandas
+numpy
+pdfplumber
+camelot-py[cv]
+pytesseract
+pdf2image
+opencv-python-headless
+openpyxl
+rapidfuzz
+pillow
