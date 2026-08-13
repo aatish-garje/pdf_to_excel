@@ -1,6 +1,6 @@
 """
 ==================================================================================
- Smart Multi-PDF to Excel Converter (Separate Excel per PDF)
+ Smart Multi-PDF to Excel Converter (Separate Excel per PDF & Master Export)
 ==================================================================================
 A production-grade Streamlit application that:
   - Accepts 100+ PDF uploads at once
@@ -8,8 +8,8 @@ A production-grade Streamlit application that:
   - Extracts tables using pdfplumber/camelot (text PDFs) or OCR (scanned PDFs)
   - Detects multi-page table continuity and merges continued tables
   - Cleans extracted data (empty rows/cols, duplicate headers, column alignment)
-  - Produces ONE Excel workbook per PDF (in-memory, no disk dependency)
-  - Offers individual downloads + a single "download all as ZIP" option
+  - Allows exporting tables into a Single Sheet or Multiple Sheets
+  - Produces Excel workbooks per PDF + an optional Master Excel for all PDFs
   - Handles errors per-file so one bad PDF never stops the batch
 
 Run with:  streamlit run app.py
@@ -36,9 +36,7 @@ import cv2
 
 from rapidfuzz import fuzz
 
-# camelot is optional at import time -- some environments (Windows without
-# Ghostscript) may fail to import it. We degrade gracefully to pdfplumber-only
-# extraction if that happens.
+# camelot is optional at import time
 try:
     import camelot
     CAMELOT_AVAILABLE = True
@@ -56,17 +54,11 @@ st.set_page_config(
     layout="wide",
 )
 
-# Minimum characters of extractable text per page before we consider a PDF
-# "text-based" rather than "scanned"
 TEXT_DENSITY_THRESHOLD = 40
-
-# Similarity thresholds used when deciding whether two tables (typically on
-# consecutive pages) are actually one logical table split by a page break.
-HEADER_SIMILARITY_THRESHOLD = 78   # rapidfuzz ratio (0-100)
-COLUMN_COUNT_TOLERANCE = 0         # allowed difference in column count
-DTYPE_SIMILARITY_THRESHOLD = 0.6   # fraction of columns whose inferred dtype matches
-
-EXCEL_SHEET_NAME_MAX_LEN = 31  # hard Excel limit
+HEADER_SIMILARITY_THRESHOLD = 78   
+COLUMN_COUNT_TOLERANCE = 0         
+DTYPE_SIMILARITY_THRESHOLD = 0.6   
+EXCEL_SHEET_NAME_MAX_LEN = 31  
 
 
 # ==================================================================================
@@ -78,19 +70,20 @@ class ExtractedTable:
     """A single raw table pulled from a PDF, tagged with provenance."""
     dataframe: pd.DataFrame
     page_number: int
-    source: str  # "camelot", "pdfplumber", "ocr"
+    source: str
 
 
 @dataclass
 class FileResult:
     """Holds the outcome of processing a single uploaded PDF."""
     filename: str
-    pdf_type: str = "unknown"          # "text" or "scanned"
-    status: str = "pending"            # pending / processing / done / error
+    pdf_type: str = "unknown"
+    status: str = "pending"
     error_message: str = ""
     sheet_names: List[str] = field(default_factory=list)
     preview_frames: Dict[str, pd.DataFrame] = field(default_factory=dict)
     excel_bytes: Optional[bytes] = None
+    tables: List[pd.DataFrame] = field(default_factory=list)  # Save extracted tables for master excel
     num_pages: int = 0
     num_tables_found: int = 0
     num_tables_after_merge: int = 0
@@ -101,16 +94,6 @@ class FileResult:
 # ==================================================================================
 
 def detect_pdf_type(pdf_bytes: bytes) -> Tuple[str, int]:
-    """
-    Determine whether a PDF is text-based or scanned (image-based).
-
-    Strategy: open with pdfplumber and measure the amount of extractable
-    text per page. If the average extractable text per page is below a
-    threshold, we assume the PDF is scanned/image-based and route it to OCR.
-
-    Returns:
-        (pdf_type, num_pages) where pdf_type is "text" or "scanned"
-    """
     try:
         with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
             num_pages = len(pdf.pages)
@@ -118,7 +101,7 @@ def detect_pdf_type(pdf_bytes: bytes) -> Tuple[str, int]:
                 return "scanned", 0
 
             total_chars = 0
-            pages_sampled = min(num_pages, 5)  # sample first few pages for speed
+            pages_sampled = min(num_pages, 5)
             for page in pdf.pages[:pages_sampled]:
                 text = page.extract_text() or ""
                 total_chars += len(text.strip())
@@ -130,26 +113,17 @@ def detect_pdf_type(pdf_bytes: bytes) -> Tuple[str, int]:
             else:
                 return "scanned", num_pages
     except Exception:
-        # If pdfplumber can't even open it, fall back to OCR path which
-        # rasterizes the PDF regardless of internal structure.
         return "scanned", 0
 
 
 # ==================================================================================
-# STEP 2A: TEXT-BASED EXTRACTION (pdfplumber + camelot)
+# STEP 2A: TEXT-BASED EXTRACTION
 # ==================================================================================
 
 def extract_text_pdf(pdf_bytes: bytes, filename: str) -> List[ExtractedTable]:
-    """
-    Extract tables from a text-based PDF using camelot first (better table
-    structure detection for ruled/lattice tables), falling back to
-    pdfplumber (works well for whitespace/stream-style tables) on pages
-    where camelot finds nothing.
-    """
     extracted: List[ExtractedTable] = []
     camelot_pages_with_tables = set()
 
-    # --- Try camelot first (needs a real file path, so use a temp file) ---
     if CAMELOT_AVAILABLE:
         tmp_path = None
         try:
@@ -168,7 +142,6 @@ def extract_text_pdf(pdf_bytes: bytes, filename: str) -> List[ExtractedTable]:
                         page_num = int(t.page) if hasattr(t, "page") else 0
                         extracted.append(ExtractedTable(df, page_num, f"camelot-{flavor}"))
                         camelot_pages_with_tables.add(page_num)
-                # If lattice already found tables, skip stream to avoid duplicates
                 if extracted:
                     break
         except Exception:
@@ -180,12 +153,11 @@ def extract_text_pdf(pdf_bytes: bytes, filename: str) -> List[ExtractedTable]:
                 except OSError:
                     pass
 
-    # --- pdfplumber fallback / complement for pages camelot missed ---
     try:
         with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
             for i, page in enumerate(pdf.pages, start=1):
                 if i in camelot_pages_with_tables:
-                    continue  # already captured by camelot
+                    continue
                 try:
                     page_tables = page.extract_tables()
                 except Exception:
@@ -199,8 +171,6 @@ def extract_text_pdf(pdf_bytes: bytes, filename: str) -> List[ExtractedTable]:
                         if not df.empty:
                             extracted.append(ExtractedTable(df, i, "pdfplumber"))
                 else:
-                    # No detected table grid -- fall back to structured text:
-                    # split lines on multiple spaces/tabs to approximate columns.
                     text = page.extract_text() or ""
                     rows = []
                     for line in text.split("\n"):
@@ -226,13 +196,6 @@ def extract_text_pdf(pdf_bytes: bytes, filename: str) -> List[ExtractedTable]:
 # ==================================================================================
 
 def preprocess_image(image: np.ndarray) -> np.ndarray:
-    """
-    Clean up a page image before OCR to improve accuracy:
-      - Convert to grayscale
-      - Denoise
-      - Adaptive thresholding (binarization)
-      - Slight dilation to make text more solid for Tesseract
-    """
     gray = cv2.cvtColor(image, cv2.COLOR_RGB2GRAY)
     denoised = cv2.fastNlMeansDenoising(gray, h=10)
     thresh = cv2.adaptiveThreshold(
@@ -245,13 +208,7 @@ def preprocess_image(image: np.ndarray) -> np.ndarray:
     processed = cv2.morphologyEx(thresh, cv2.MORPH_CLOSE, kernel)
     return processed
 
-
 def _words_to_table(ocr_data: Dict[str, list], y_tolerance: int = 12) -> pd.DataFrame:
-    """
-    Reconstruct a pseudo-table from pytesseract's word-level bounding boxes.
-    Words are grouped into rows by vertical (top) proximity, then ordered
-    left-to-right within each row to approximate columns.
-    """
     words = []
     n = len(ocr_data["text"])
     for i in range(n):
@@ -264,7 +221,7 @@ def _words_to_table(ocr_data: Dict[str, list], y_tolerance: int = 12) -> pd.Data
         except (ValueError, TypeError):
             conf_val = -1
         if conf_val != -1 and conf_val < 30:
-            continue  # skip very low-confidence noise
+            continue
         words.append({
             "text": text,
             "left": ocr_data["left"][i],
@@ -275,7 +232,6 @@ def _words_to_table(ocr_data: Dict[str, list], y_tolerance: int = 12) -> pd.Data
         return pd.DataFrame()
 
     words.sort(key=lambda w: w["top"])
-
     rows = []
     current_row = [words[0]]
     current_top = words[0]["top"]
@@ -299,15 +255,7 @@ def _words_to_table(ocr_data: Dict[str, list], y_tolerance: int = 12) -> pd.Data
 
     return pd.DataFrame(table_rows)
 
-
 def extract_ocr_pdf(pdf_bytes: bytes, filename: str, dpi: int = 200) -> List[ExtractedTable]:
-    """
-    Extract structured tabular data from a scanned PDF via OCR:
-      1. Rasterize each page with pdf2image (requires Poppler)
-      2. Preprocess each page image with OpenCV
-      3. Run pytesseract in "data" mode to get word bounding boxes
-      4. Reconstruct rows/columns from those bounding boxes
-    """
     extracted: List[ExtractedTable] = []
     try:
         pages = convert_from_bytes(pdf_bytes, dpi=dpi)
@@ -325,38 +273,31 @@ def extract_ocr_pdf(pdf_bytes: bytes, filename: str, dpi: int = 200) -> List[Ext
             if not df.empty:
                 extracted.append(ExtractedTable(df, i, "ocr"))
         except Exception:
-            # Skip pages that fail OCR but keep processing the rest
             continue
 
     return extracted
 
 
 # ==================================================================================
-# STEP 3: MULTI-PAGE TABLE CONTINUITY DETECTION
+# STEP 3: CONTINUITY DETECTION & MERGING
 # ==================================================================================
 
 def _infer_column_dtype_signature(series: pd.Series) -> str:
-    """Cheap heuristic dtype classification per column: numeric / date / text."""
     sample = series.dropna().astype(str).str.strip()
     sample = sample[sample != ""].head(20)
     if sample.empty:
         return "empty"
-
     numeric_count = sum(bool(re.fullmatch(r"-?\d+(\.\d+)?%?", v)) for v in sample)
     date_count = sum(bool(re.fullmatch(r"\d{1,4}[/-]\d{1,2}[/-]\d{1,4}", v)) for v in sample)
-
     if numeric_count / len(sample) >= 0.6:
         return "numeric"
     if date_count / len(sample) >= 0.6:
         return "date"
     return "text"
 
-
 def _dtype_signature_similarity(df1: pd.DataFrame, df2: pd.DataFrame) -> float:
-    """Fraction of corresponding columns whose inferred dtype signature matches."""
     n = min(len(df1.columns), len(df2.columns))
-    if n == 0:
-        return 0.0
+    if n == 0: return 0.0
     matches = 0
     for c in range(n):
         sig1 = _infer_column_dtype_signature(df1.iloc[:, c])
@@ -365,91 +306,46 @@ def _dtype_signature_similarity(df1: pd.DataFrame, df2: pd.DataFrame) -> float:
             matches += 1
     return matches / n
 
-
 def _header_similarity(df1: pd.DataFrame, df2: pd.DataFrame) -> float:
-    """Average fuzzy-match ratio between the two tables' first (header) rows."""
     header1 = [str(x) for x in df1.iloc[0].tolist()] if len(df1) else []
     header2 = [str(x) for x in df2.iloc[0].tolist()] if len(df2) else []
-    if not header1 or not header2:
-        return 0.0
+    if not header1 or not header2: return 0.0
     n = min(len(header1), len(header2))
     scores = [fuzz.ratio(header1[i], header2[i]) for i in range(n)]
     return sum(scores) / len(scores) if scores else 0.0
 
-
 def are_tables_similar(df1: pd.DataFrame, df2: pd.DataFrame) -> bool:
-    """
-    Decide whether two tables (usually from consecutive pages) are actually
-    a single logical table that was split across a page break.
-
-    Compares:
-      - Column count (must match, within tolerance)
-      - Header similarity (fuzzy string match via rapidfuzz)
-      - Data type pattern similarity per column
-      - General row/column consistency
-    """
-    if df1.empty or df2.empty:
-        return False
-
+    if df1.empty or df2.empty: return False
     col_diff = abs(len(df1.columns) - len(df2.columns))
-    if col_diff > COLUMN_COUNT_TOLERANCE:
-        return False
-
+    if col_diff > COLUMN_COUNT_TOLERANCE: return False
     header_score = _header_similarity(df1, df2)
     dtype_score = _dtype_signature_similarity(df1, df2)
 
-    # Two ways to qualify as "the same table":
-    #  (a) headers look alike (repeated header row on the new page), or
-    #  (b) headers don't match (no repeated header) but the data pattern
-    #      (column dtypes) lines up well, implying continuous data rows.
-    if header_score >= HEADER_SIMILARITY_THRESHOLD:
-        return True
-    if dtype_score >= DTYPE_SIMILARITY_THRESHOLD and header_score >= 40:
-        return True
-
+    if header_score >= HEADER_SIMILARITY_THRESHOLD: return True
+    if dtype_score >= DTYPE_SIMILARITY_THRESHOLD and header_score >= 40: return True
     return False
 
-
 def merge_tables(tables: List[pd.DataFrame]) -> pd.DataFrame:
-    """
-    Merge a list of tables believed to be one logical table split across
-    pages. Removes repeated header rows that appear again on later pages.
-    """
-    if not tables:
-        return pd.DataFrame()
-    if len(tables) == 1:
-        return tables[0].reset_index(drop=True)
+    if not tables: return pd.DataFrame()
+    if len(tables) == 1: return tables[0].reset_index(drop=True)
 
     base_header = [str(x).strip().lower() for x in tables[0].iloc[0].tolist()]
     merged_frames = [tables[0]]
 
     for t in tables[1:]:
-        if t.empty:
-            continue
+        if t.empty: continue
         first_row = [str(x).strip().lower() for x in t.iloc[0].tolist()]
-        # If this table's first row matches the base table's header, drop it
-        # (it's a repeated header, not real data) before appending.
         n = min(len(first_row), len(base_header))
         if n and fuzz.ratio(" ".join(first_row[:n]), " ".join(base_header[:n])) >= HEADER_SIMILARITY_THRESHOLD:
             merged_frames.append(t.iloc[1:])
         else:
             merged_frames.append(t)
 
-    merged = pd.concat(merged_frames, ignore_index=True, sort=False)
-    return merged
-
+    return pd.concat(merged_frames, ignore_index=True, sort=False)
 
 def group_and_merge_tables(extracted_tables: List[ExtractedTable]) -> List[pd.DataFrame]:
-    """
-    Walk through extracted tables in page order and greedily merge any
-    that appear to be continuations of one another. Returns a list of
-    final logical tables (one per output sheet).
-    """
-    if not extracted_tables:
-        return []
-
+    if not extracted_tables: return []
     ordered = sorted(extracted_tables, key=lambda t: t.page_number)
-
     groups: List[List[pd.DataFrame]] = [[ordered[0].dataframe]]
 
     for et in ordered[1:]:
@@ -468,38 +364,17 @@ def group_and_merge_tables(extracted_tables: List[ExtractedTable]) -> List[pd.Da
 # ==================================================================================
 
 def clean_tables(df: pd.DataFrame) -> pd.DataFrame:
-    """
-    Clean a single extracted table:
-      - Drop fully empty rows and columns
-      - Normalize whitespace in text cells
-      - Promote the first row to header when it looks like a header
-      - Remove duplicate header rows left over from merges
-      - Align/pad inconsistent row lengths
-    """
-    if df is None or df.empty:
-        return pd.DataFrame()
-
+    if df is None or df.empty: return pd.DataFrame()
     df = df.copy()
 
-    # Normalize all cell text: strip whitespace, collapse internal spaces
-    df = df.astype(str).apply(
-        lambda col: col.str.replace(r"\s+", " ", regex=True).str.strip()
-    )
-
-    # Replace empty-string cells with NaN so dropna works correctly
+    df = df.astype(str).apply(lambda col: col.str.replace(r"\s+", " ", regex=True).str.strip())
     df = df.replace(r"^\s*$", np.nan, regex=True)
-
-    # Drop fully empty rows/columns
     df = df.dropna(axis=0, how="all")
     df = df.dropna(axis=1, how="all")
 
-    if df.empty:
-        return df
-
+    if df.empty: return df
     df = df.reset_index(drop=True)
 
-    # Promote first row to header if it doesn't look like a data row
-    # (heuristic: header row usually has more distinct/non-numeric values)
     first_row = df.iloc[0]
     non_null_ratio = first_row.notna().mean()
     if non_null_ratio > 0.5:
@@ -508,7 +383,6 @@ def clean_tables(df: pd.DataFrame) -> pd.DataFrame:
     else:
         df.columns = [f"col_{i}" for i in range(len(df.columns))]
 
-    # Deduplicate column names (Excel/pandas requires uniqueness)
     seen = {}
     new_cols = []
     for c in df.columns:
@@ -521,22 +395,17 @@ def clean_tables(df: pd.DataFrame) -> pd.DataFrame:
             new_cols.append(c)
     df.columns = new_cols
 
-    # Remove any remaining rows that exactly duplicate the header text
-    # (leftover repeated headers from page breaks)
     header_lower = [str(c).strip().lower() for c in df.columns]
-
     def _is_header_dup(row):
         vals = [str(v).strip().lower() for v in row.tolist()]
         n = min(len(vals), len(header_lower))
-        if n == 0:
-            return False
+        if n == 0: return False
         return fuzz.ratio(" ".join(vals[:n]), " ".join(header_lower[:n])) >= HEADER_SIMILARITY_THRESHOLD
 
     if len(df) > 0:
         dup_mask = df.apply(_is_header_dup, axis=1)
         df = df[~dup_mask]
 
-    # Drop exact duplicate rows and fully empty rows again post-cleanup
     df = df.drop_duplicates(keep="first")
     df = df.dropna(axis=0, how="all")
     df = df.reset_index(drop=True)
@@ -545,11 +414,10 @@ def clean_tables(df: pd.DataFrame) -> pd.DataFrame:
 
 
 # ==================================================================================
-# EXCEL WORKBOOK GENERATION
+# EXCEL WORKBOOK GENERATION (Single Sheet vs Multi Sheet)
 # ==================================================================================
 
 def _safe_sheet_name(name: str, used_names: set) -> str:
-    """Sanitize and de-duplicate an Excel sheet name (max 31 chars, no bad chars)."""
     name = re.sub(r"[\[\]:*?/\\]", "_", name).strip() or "Sheet"
     name = name[:EXCEL_SHEET_NAME_MAX_LEN]
     base = name
@@ -561,12 +429,10 @@ def _safe_sheet_name(name: str, used_names: set) -> str:
     used_names.add(name)
     return name
 
-
-def build_excel_workbook(tables: List[pd.DataFrame]) -> Tuple[bytes, List[str], Dict[str, pd.DataFrame]]:
+def build_excel_workbook(tables: List[pd.DataFrame], layout_mode: str = "multi") -> Tuple[bytes, List[str], Dict[str, pd.DataFrame]]:
     """
-    Write a list of cleaned tables into a single in-memory Excel workbook,
-    one sheet per table. Returns the workbook bytes, the sheet names used,
-    and a preview dict (sheet_name -> first rows) for the UI.
+    Write a list of cleaned tables into an Excel workbook.
+    Supports single sheet (stacked tables) or multiple sheets (one table per tab).
     """
     output = io.BytesIO()
     used_names: set = set()
@@ -575,31 +441,49 @@ def build_excel_workbook(tables: List[pd.DataFrame]) -> Tuple[bytes, List[str], 
 
     with pd.ExcelWriter(output, engine="openpyxl") as writer:
         if not tables:
-            pd.DataFrame({"Notice": ["No tables could be extracted from this PDF."]}).to_excel(
+            pd.DataFrame({"Notice": ["No tables could be extracted."]}).to_excel(
                 writer, sheet_name="Sheet1", index=False
             )
             sheet_names.append("Sheet1")
         else:
-            for idx, df in enumerate(tables, start=1):
-                if df.empty:
-                    continue
-                sheet_name = _safe_sheet_name(f"Table_{idx}", used_names)
-                df.to_excel(writer, sheet_name=sheet_name, index=False)
+            if layout_mode == "single":
+                sheet_name = _safe_sheet_name("All_Tables", used_names)
                 sheet_names.append(sheet_name)
-                previews[sheet_name] = df.head(5)
+                current_row = 0
+                
+                for idx, df in enumerate(tables):
+                    if df.empty:
+                        continue
+                    if current_row == 0:
+                        previews[sheet_name] = df.head(5)
+                        
+                    # Add a visual separator/label row for clarity between tables
+                    label_df = pd.DataFrame(columns=[f"--- Table {idx+1} ---"])
+                    label_df.to_excel(writer, sheet_name=sheet_name, startrow=current_row, index=False)
+                    
+                    # Write the actual data underneath
+                    df.to_excel(writer, sheet_name=sheet_name, startrow=current_row + 1, index=False)
+                    
+                    # Update current_row to position the next table (Data Length + Header + Label + Empty Gap)
+                    current_row += len(df) + 4
+            else:
+                # Traditional Mode: One Table per Sheet
+                for idx, df in enumerate(tables, start=1):
+                    if df.empty:
+                        continue
+                    sheet_name = _safe_sheet_name(f"Table_{idx}", used_names)
+                    df.to_excel(writer, sheet_name=sheet_name, index=False)
+                    sheet_names.append(sheet_name)
+                    previews[sheet_name] = df.head(5)
 
     return output.getvalue(), sheet_names, previews
 
 
 # ==================================================================================
-# STEP 5: SINGLE-PDF PIPELINE
+# STEP 5 & 6: PIPELINE EXECUTORS
 # ==================================================================================
 
-def process_single_pdf(filename: str, pdf_bytes: bytes) -> FileResult:
-    """
-    Run the full pipeline on one PDF: detect type -> extract -> merge
-    continued tables -> clean -> build Excel workbook.
-    """
+def process_single_pdf(filename: str, pdf_bytes: bytes, layout_mode: str) -> FileResult:
     result = FileResult(filename=filename, status="processing")
 
     pdf_type, num_pages = detect_pdf_type(pdf_bytes)
@@ -612,14 +496,15 @@ def process_single_pdf(filename: str, pdf_bytes: bytes) -> FileResult:
         raw_tables = extract_ocr_pdf(pdf_bytes, filename)
 
     result.num_tables_found = len(raw_tables)
-
     merged_tables = group_and_merge_tables(raw_tables)
+    
     cleaned_tables = [clean_tables(df) for df in merged_tables]
     cleaned_tables = [df for df in cleaned_tables if not df.empty]
-
+    
+    result.tables = cleaned_tables  # Store for master-excel batching
     result.num_tables_after_merge = len(cleaned_tables)
 
-    excel_bytes, sheet_names, previews = build_excel_workbook(cleaned_tables)
+    excel_bytes, sheet_names, previews = build_excel_workbook(cleaned_tables, layout_mode)
     result.excel_bytes = excel_bytes
     result.sheet_names = sheet_names
     result.preview_frames = previews
@@ -628,20 +513,12 @@ def process_single_pdf(filename: str, pdf_bytes: bytes) -> FileResult:
     return result
 
 
-# ==================================================================================
-# STEP 6: BATCH PIPELINE (MULTIPLE PDFs)
-# ==================================================================================
-
 def process_multiple_pdfs(
     uploaded_files: list,
     overall_progress_bar,
     status_container,
+    layout_mode: str
 ) -> List[FileResult]:
-    """
-    Process a batch of uploaded PDFs sequentially, updating a shared
-    progress bar and a live status area. Errors in one file are caught
-    and recorded without stopping the batch.
-    """
     results: List[FileResult] = []
     total = len(uploaded_files)
 
@@ -653,11 +530,11 @@ def process_multiple_pdfs(
 
         try:
             pdf_bytes = uploaded_file.getvalue()
-            result = process_single_pdf(filename, pdf_bytes)
+            result = process_single_pdf(filename, pdf_bytes, layout_mode)
             results.append(result)
             row_placeholder.success(
                 f"✅ **{filename}** — type: `{result.pdf_type}` — "
-                f"{result.num_tables_after_merge} sheet(s) generated "
+                f"Generated **{len(result.sheet_names)}** sheet(s) "
                 f"({result.num_pages} pages)"
             )
         except Exception as e:
@@ -673,9 +550,7 @@ def process_multiple_pdfs(
 
     return results
 
-
 def build_zip_of_excels(results: List[FileResult]) -> bytes:
-    """Bundle every successfully-generated Excel file into a single ZIP (in-memory)."""
     zip_buffer = io.BytesIO()
     with zipfile.ZipFile(zip_buffer, "w", zipfile.ZIP_DEFLATED) as zf:
         for r in results:
@@ -693,25 +568,36 @@ def main():
     st.title("📊 Multi-PDF to Excel Converter")
     st.caption(
         "Upload multiple PDFs (text-based or scanned). Each PDF is converted into "
-        "its own Excel workbook, with multi-page tables intelligently merged."
+        "an Excel workbook, with multi-page tables intelligently merged."
     )
 
     if not CAMELOT_AVAILABLE:
         st.warning(
             "⚠️ `camelot-py` (or its Ghostscript dependency) is not available in this "
-            "environment. Text-based extraction will fall back to pdfplumber only, "
-            "which still works but may be slightly less precise for ruled tables."
+            "environment. Text-based extraction will fall back to pdfplumber only."
         )
 
     with st.sidebar:
         st.header("⚙️ Settings")
+        
+        st.subheader("Data Export Layout")
+        sheet_layout = st.radio(
+            "How should tables be formatted inside the Excel file?",
+            options=[
+                "Multi-Sheet (One table per tab)", 
+                "Single-Sheet (All tables stacked vertically)"
+            ],
+            index=0,
+            help="Choose whether to place each extracted table on its own Excel tab, or stack them all on a single tab with spacing."
+        )
+        layout_mode = "single" if "Single" in sheet_layout else "multi"
+
+        st.markdown("---")
         ocr_dpi = st.slider("OCR rasterization DPI", 100, 300, 200, step=25,
                              help="Higher DPI improves OCR accuracy but is slower.")
+        
         st.markdown("---")
-        st.markdown(
-            "**Tech stack:** pdfplumber, camelot, pytesseract, pdf2image, "
-            "OpenCV, rapidfuzz, openpyxl"
-        )
+        st.markdown("**Tech stack:** pdfplumber, camelot, pytesseract, pdf2image, OpenCV, rapidfuzz, openpyxl")
 
     uploaded_files = st.file_uploader(
         "Upload PDF files (you can select 100+ at once)",
@@ -737,21 +623,17 @@ def main():
             overall_progress_bar = st.progress(0, text="Overall progress: 0/0 files")
             status_container = st.container()
 
-            # Monkeypatch dpi into extract_ocr_pdf via a wrapper so the sidebar
-            # setting is respected without changing the function signature.
             global extract_ocr_pdf
             original_ocr_fn = extract_ocr_pdf
 
             def _ocr_with_dpi(pdf_bytes, filename, dpi=ocr_dpi):
                 return original_ocr_fn(pdf_bytes, filename, dpi=dpi)
-
             extract_ocr_pdf = _ocr_with_dpi
 
             with st.spinner("Converting PDFs to Excel... this may take a while for large batches."):
-                results = process_multiple_pdfs(uploaded_files, overall_progress_bar, status_container)
+                results = process_multiple_pdfs(uploaded_files, overall_progress_bar, status_container, layout_mode)
 
-            extract_ocr_pdf = original_ocr_fn  # restore
-
+            extract_ocr_pdf = original_ocr_fn  
             st.session_state["results"] = results
             st.success("🎉 Batch processing complete!")
 
@@ -773,14 +655,41 @@ def main():
         summary_cols[2].metric("Failed", len(error_results))
 
         if done_results:
+            st.markdown("#### Batch Actions")
+            colA, colB = st.columns(2)
+            
+            # Action 1: ZIP of individual files
             zip_bytes = build_zip_of_excels(done_results)
-            st.download_button(
-                label=f"⬇️ Download ALL as ZIP ({len(done_results)} files)",
+            colA.download_button(
+                label=f"⬇️ Download {len(done_results)} files as ZIP",
                 data=zip_bytes,
                 file_name="converted_excels.zip",
                 mime="application/zip",
                 type="primary",
+                use_container_width=True
             )
+            
+            # Action 2: Massive master combined file
+            master_tables = []
+            for r in done_results:
+                for t in r.tables:
+                    t_copy = t.copy()
+                    if "Source PDF" not in t_copy.columns:
+                        t_copy.insert(0, "Source PDF", r.filename) # Insert origin filename
+                    master_tables.append(t_copy)
+                    
+            if master_tables:
+                # Master file is typically best dumped as a single stacked sheet
+                master_excel_bytes, _, _ = build_excel_workbook(master_tables, layout_mode="single")
+                colB.download_button(
+                    label="⬇️ Download ONE Master Excel (All PDFs Combined)",
+                    data=master_excel_bytes,
+                    file_name="Master_Combined_Data.xlsx",
+                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                    type="secondary",
+                    use_container_width=True,
+                    help="Combine every table from every PDF into a single Excel file."
+                )
 
         st.markdown("#### Individual files")
         for r in results:
@@ -793,7 +702,7 @@ def main():
                 meta_cols[0].write(f"**Type detected:** `{r.pdf_type}`")
                 meta_cols[1].write(f"**Pages:** {r.num_pages}")
                 meta_cols[2].write(f"**Tables found:** {r.num_tables_found}")
-                meta_cols[3].write(f"**Sheets after merge:** {r.num_tables_after_merge}")
+                meta_cols[3].write(f"**Sheets/Tables post-merge:** {r.num_tables_after_merge}")
 
                 if r.excel_bytes:
                     base_name = os.path.splitext(r.filename)[0]
@@ -806,9 +715,9 @@ def main():
                     )
 
                 if r.preview_frames:
-                    st.markdown("**Preview (first rows of each sheet):**")
+                    st.markdown("**Preview:**")
                     for sheet_name, preview_df in r.preview_frames.items():
-                        st.caption(f"Sheet: {sheet_name}")
+                        st.caption(f"Sheet / View: {sheet_name}")
                         st.dataframe(preview_df, use_container_width=True)
     else:
         st.info("Upload PDF files above and click **Start Conversion** to begin.")
