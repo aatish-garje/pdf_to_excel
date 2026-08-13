@@ -209,15 +209,14 @@ def preprocess_image(image: np.ndarray) -> np.ndarray:
     return processed
 
 
-def _words_to_table(ocr_data: Dict[str, list]) -> pd.DataFrame:
+def _words_to_table(ocr_data: Dict[str, list]) -> List[pd.DataFrame]:
     """
-    Reconstruct a pseudo-table from pytesseract's word-level bounding boxes.
-    Uses an X-axis projection histogram to detect absolute column boundaries
-    across the entire page, ensuring empty cells don't shift data leftwards.
+    Reconstruct tables from pytesseract's word-level bounding boxes.
+    Uses Block-wise Spatial Projection to handle pages with multiple 
+    differing table layouts (e.g., Header Key-Values vs Main Data Grid).
     """
     words = []
     n = len(ocr_data["text"])
-    max_right = 0
     
     for i in range(n):
         text = ocr_data["text"][i].strip()
@@ -235,36 +234,50 @@ def _words_to_table(ocr_data: Dict[str, list]) -> pd.DataFrame:
         top = ocr_data["top"][i]
         width = ocr_data["width"][i]
         height = ocr_data["height"][i]
-        right = left + width
-        bottom = top + height
-        
-        if right > max_right:
-            max_right = right
             
         words.append({
             "text": text,
             "left": left,
-            "right": right,
+            "right": left + width,
             "top": top,
-            "bottom": bottom,
+            "bottom": top + height,
             "center_x": left + (width / 2.0),
-            "center_y": top + (height / 2.0)
+            "center_y": top + (height / 2.0),
+            "width": width,
+            "height": height
         })
 
     if not words:
-        return pd.DataFrame()
+        return []
 
-    # 1. Group into rows via dynamic Y tolerance based on text height
-    avg_height = sum(w["bottom"] - w["top"] for w in words) / len(words)
-    dynamic_y_tol = max(avg_height * 0.4, 5) 
+    # Filter out purely structural grid characters
+    data_words = [w for w in words if not re.fullmatch(r'[|_\-]', w["text"])]
+    if not data_words:
+        data_words = words
+
+    # Filter out extreme outliers (like QR codes or noise)
+    heights = sorted([w["height"] for w in data_words])
+    median_height = heights[len(heights) // 2]
     
-    words.sort(key=lambda w: w["center_y"])
+    cleaned_words = []
+    for w in data_words:
+        if 0.4 * median_height <= w["height"] <= 3.5 * median_height:
+            cleaned_words.append(w)
+            
+    if not cleaned_words:
+        cleaned_words = data_words
+
+    # 1. Group into rows via dynamic Y tolerance
+    avg_height = sum(w["height"] for w in cleaned_words) / len(cleaned_words)
+    dynamic_y_tol = max(avg_height * 0.4, 4) 
+    
+    cleaned_words.sort(key=lambda w: w["center_y"])
     
     rows = []
-    current_row = [words[0]]
-    current_y = words[0]["center_y"]
+    current_row = [cleaned_words[0]]
+    current_y = cleaned_words[0]["center_y"]
 
-    for w in words[1:]:
+    for w in cleaned_words[1:]:
         if abs(w["center_y"] - current_y) <= dynamic_y_tol:
             current_row.append(w)
             current_y = sum(x["center_y"] for x in current_row) / len(current_row)
@@ -275,80 +288,120 @@ def _words_to_table(ocr_data: Dict[str, list]) -> pd.DataFrame:
     if current_row:
         rows.append(current_row)
 
-    # 2. X-axis projection to find global column boundaries
-    # Create a 1D array of the page width. Dilate word boxes slightly to merge nearby text.
-    dilation = int(max(avg_height * 0.8, 10)) 
-    x_profile = np.zeros(max_right + dilation + 2)
+    # 2. Group rows into layout Blocks (Zones) based on vertical spacing
+    # If the gap between lines is significantly large, it's a new table layout.
+    blocks = []
+    current_block = [rows[0]]
     
-    page_width = max_right
-    for w in words:
-        # Ignore extremely wide artifacts (e.g., horizontal lines) for layout planning
-        if w["right"] - w["left"] > page_width * 0.8 and page_width > 100:
+    for i in range(1, len(rows)):
+        prev_row = rows[i-1]
+        curr_row = rows[i]
+        
+        prev_y = sum(w["center_y"] for w in prev_row) / len(prev_row)
+        curr_y = sum(w["center_y"] for w in curr_row) / len(curr_row)
+        gap_y = curr_y - prev_y
+        
+        # A gap larger than ~2.2x font height means a major layout break
+        if gap_y > avg_height * 2.2:
+            blocks.append(current_block)
+            current_block = [curr_row]
+        else:
+            current_block.append(curr_row)
+            
+    if current_block:
+        blocks.append(current_block)
+
+    # 3. Process each Block independently to find its exact columns
+    dfs = []
+    for block_rows in blocks:
+        block_words = [w for row in block_rows for w in row]
+        if not block_words:
             continue
             
-        start = max(0, w["left"] - dilation)
-        end = min(len(x_profile) - 1, w["right"] + dilation)
-        x_profile[start:end] = 1
+        block_max_right = max(w["right"] for w in block_words)
         
-    # Find contiguous blocks of 1s (these are our established columns)
-    cols = []
-    in_col = False
-    start_idx = 0
-    for i, val in enumerate(x_profile):
-        if val == 1 and not in_col:
-            in_col = True
-            start_idx = i
-        elif val == 0 and in_col:
-            in_col = False
-            cols.append((start_idx, i))
-    if in_col:
-        cols.append((start_idx, len(x_profile)))
+        # X-axis projection for THIS BLOCK ONLY
+        dilation = int(max(avg_height * 0.25, 2))
+        x_profile = np.zeros(int(block_max_right) + dilation + 2)
         
-    if not cols:
-        cols = [(0, max_right)]
+        for w in block_words:
+            start = max(0, w["left"] - dilation)
+            end = min(len(x_profile) - 1, w["right"] + dilation)
+            x_profile[start:end] += 1
+            
+        raw_cols = []
+        in_col = False
+        start_idx = 0
+        for i, val in enumerate(x_profile):
+            if val > 0 and not in_col:
+                in_col = True
+                start_idx = i
+            elif val == 0 and in_col:
+                in_col = False
+                raw_cols.append((start_idx, i))
+        if in_col:
+            raw_cols.append((start_idx, len(x_profile)))
+            
+        if not raw_cols:
+            continue
 
-    # 3. Map words to the detected columns across the grid
-    table_rows = []
-    for row in rows:
-        row_data = [""] * len(cols)
-        row.sort(key=lambda w: w["left"])
-        
-        for w in row:
-            word_center_x = w["center_x"]
-            assigned_col_idx = -1
+        cols = [raw_cols[0]]
+        for i in range(1, len(raw_cols)):
+            prev_start, prev_end = cols[-1]
+            curr_start, curr_end = raw_cols[i]
+            gap = curr_start - prev_end
             
-            # First try strict containment within a column
-            for idx, (c_start, c_end) in enumerate(cols):
-                if c_start <= word_center_x <= c_end:
-                    assigned_col_idx = idx
-                    break
-                    
-            # Fallback to closest column if text is slightly misaligned
-            if assigned_col_idx == -1:
-                distances = []
-                for idx, (c_start, c_end) in enumerate(cols):
-                    if word_center_x < c_start:
-                        distances.append((idx, c_start - word_center_x))
-                    else:
-                        distances.append((idx, word_center_x - c_end))
-                assigned_col_idx = min(distances, key=lambda x: x[1])[0]
-            
-            if row_data[assigned_col_idx] == "":
-                row_data[assigned_col_idx] = w["text"]
+            # Bridge internal spaces but preserve true column gaps
+            if gap <= max(avg_height * 0.35, 4):
+                cols[-1] = (prev_start, curr_end)
             else:
-                row_data[assigned_col_idx] += " " + w["text"]
+                cols.append((curr_start, curr_end))
+
+        # 4. Map words to the precise columns detected
+        table_rows = []
+        for row in block_rows:
+            row_data = [""] * len(cols)
+            row.sort(key=lambda w: w["left"])
+            
+            for w in row:
+                word_center_x = w["center_x"]
+                assigned_col_idx = -1
                 
-        table_rows.append(row_data)
+                # Strict containment
+                for idx, (c_start, c_end) in enumerate(cols):
+                    if c_start <= word_center_x <= c_end:
+                        assigned_col_idx = idx
+                        break
+                        
+                # Closest column fallback
+                if assigned_col_idx == -1:
+                    distances = []
+                    for idx, (c_start, c_end) in enumerate(cols):
+                        if word_center_x < c_start:
+                            distances.append((idx, c_start - word_center_x))
+                        else:
+                            distances.append((idx, word_center_x - c_end))
+                    assigned_col_idx = min(distances, key=lambda x: x[1])[0]
+                
+                if row_data[assigned_col_idx] == "":
+                    row_data[assigned_col_idx] = w["text"]
+                else:
+                    row_data[assigned_col_idx] += " " + w["text"]
+                    
+            table_rows.append(row_data)
 
-    df = pd.DataFrame(table_rows)
-    
-    # Cleanup empty placeholder columns
-    df.replace(r'^\s*$', np.nan, regex=True, inplace=True)
-    df.dropna(how="all", axis=1, inplace=True)
-    df.fillna("", inplace=True)
-    df.columns = [str(i) for i in range(len(df.columns))]
+        df = pd.DataFrame(table_rows)
+        
+        # Cleanup block
+        df.replace(r'^\s*$', np.nan, regex=True, inplace=True)
+        df.dropna(how="all", axis=1, inplace=True)
+        df.fillna("", inplace=True)
+        
+        if not df.empty and len(df.columns) > 0:
+            df.columns = [str(i) for i in range(len(df.columns))]
+            dfs.append(df)
 
-    return df
+    return dfs
 
 
 def extract_ocr_pdf(pdf_bytes: bytes, filename: str, dpi: int = 200) -> List[ExtractedTable]:
@@ -362,12 +415,16 @@ def extract_ocr_pdf(pdf_bytes: bytes, filename: str, dpi: int = 200) -> List[Ext
         try:
             img = np.array(pil_page.convert("RGB"))
             processed = preprocess_image(img)
+            
             ocr_data = pytesseract.image_to_data(
-                processed, output_type=pytesseract.Output.DICT
+                processed, output_type=pytesseract.Output.DICT, config="--psm 6"
             )
-            df = _words_to_table(ocr_data)
-            if not df.empty:
-                extracted.append(ExtractedTable(df, i, "ocr"))
+            
+            # Map each block layout into its own standalone table mapping
+            dfs = _words_to_table(ocr_data)
+            for df in dfs:
+                if not df.empty:
+                    extracted.append(ExtractedTable(df, i, "ocr"))
         except Exception:
             continue
 
