@@ -489,100 +489,160 @@ def group_and_merge_tables(extracted_tables: List[ExtractedTable]) -> List[pd.Da
 
 
 # ==================================================================================
-# STEP 4: DATA CLEANING
+# STEP 4: DATA CLEANING & POST-PROCESSING
 # ==================================================================================
 
-def clean_tables(df: pd.DataFrame) -> pd.DataFrame:
-    if df is None or df.empty:
-        return pd.DataFrame()
+def detect_header_row(df: pd.DataFrame) -> int:
+    """Finds the row containing business keywords. Does not assume first row."""
+    keywords = {"date", "invoice", "qty", "quantity", "value", "tax", "amount", "price", "net", "sgst", "cgst", "igst"}
+    best_row_idx = -1
+    max_score = 0
+    
+    # Scan top 20 rows
+    for i in range(min(20, len(df))):
+        row_vals = [str(v).lower().strip() for v in df.iloc[i].values if pd.notna(v) and str(v).strip() not in ('', 'nan')]
+        score = sum(1 for v in row_vals if any(kw in v for kw in keywords))
+        
+        if score > max_score and score >= 2: 
+            max_score = score
+            best_row_idx = i
+            
+    return best_row_idx
 
-    df = df.copy()
+def apply_header(df: pd.DataFrame, header_idx: int) -> pd.DataFrame:
+    """Sets the detected row as df.columns and removes all rows above it."""
+    if header_idx == -1:
+        return df
+        
+    header_row = df.iloc[header_idx].astype(str).tolist()
+    df.columns = header_row
+    
+    # Drop everything above and including the header
+    df = df.iloc[header_idx+1:].reset_index(drop=True)
+    return df
 
-    # STEP 1: Normalize text
-    df = df.astype(str).apply(lambda col: col.str.replace(r"\s+", " ", regex=True).str.strip())
+def remove_metadata_rows(df: pd.DataFrame) -> pd.DataFrame:
+    """Removes rows containing metadata keywords."""
+    metadata_keywords = {"psf", "plant", "annexure", "gst", "cin", "effective from", "effective to"}
+    
+    def is_metadata(row):
+        text = " ".join([str(v).lower() for v in row if pd.notna(v)])
+        return any(kw in text for kw in metadata_keywords)
+        
+    mask = df.apply(is_metadata, axis=1)
+    return df[~mask].reset_index(drop=True)
+
+def remove_noise_columns(df: pd.DataFrame) -> pd.DataFrame:
+    """Drops columns that are fully empty, >80% empty, or contain no numeric data/meaningful text."""
+    df = df.replace(r"^\s*nan\s*$", np.nan, regex=True, flags=re.IGNORECASE)
     df = df.replace(r"^\s*$", np.nan, regex=True)
-    df = df.dropna(axis=0, how="all")
+    
+    # Drop fully empty
     df = df.dropna(axis=1, how="all")
-
     if df.empty:
         return df
+        
+    # Drop >80% empty
+    min_non_na = int(len(df) * 0.2) 
+    if min_non_na > 0:
+        df = df.dropna(axis=1, thresh=min_non_na)
+        
+    cols_to_keep = []
+    for col in df.columns:
+        vals = df[col].dropna().astype(str)
+        if len(vals) == 0:
+            continue
+            
+        has_numeric = vals.str.contains(r'\d').any()
+        is_only_punctuation = all(re.fullmatch(r'[^a-zA-Z0-9]', v) for v in vals)
+        
+        if has_numeric or not is_only_punctuation:
+            cols_to_keep.append(col)
+            
+    return df[cols_to_keep]
 
-    df = df.reset_index(drop=True)
-
-    # STEP 2: Remove metadata rows
-    metadata_keywords = ["psf", "plant", "annexure", "gst", "cin"]
-
-    df = df[
-        ~df.apply(
-            lambda row: any(
-                k in " ".join(row.astype(str)).lower()
-                for k in metadata_keywords
-            ),
-            axis=1
-        )
-    ]
-
-    df = df.reset_index(drop=True)
-
-    # STEP 3: Detect header row
-    header_idx = 0
-    for i, row in df.iterrows():
-        text = " ".join(row.astype(str)).lower()
-        if "date" in text and ("invoice" in text or "qty" in text or "value" in text):
-            header_idx = i
-            break
-
-    # STEP 4: Apply header
-    df.columns = [
-        str(c) if pd.notna(c) else f"col_{i}"
-        for i, c in enumerate(df.iloc[header_idx])
-    ]
-    df = df.iloc[header_idx + 1:].reset_index(drop=True)
-
-    # STEP 5: Remove duplicate header rows
-    header_lower = [str(c).strip().lower() for c in df.columns]
-
-    def _is_header_dup(row):
-        vals = [str(v).strip().lower() for v in row.tolist()]
-        n = min(len(vals), len(header_lower))
-        if n == 0:
-            return False
-        return fuzz.ratio(" ".join(vals[:n]), " ".join(header_lower[:n])) >= HEADER_SIMILARITY_THRESHOLD
-
-    if len(df) > 0:
-        df = df[~df.apply(_is_header_dup, axis=1)]
-
-    # STEP 6: Clean column names
+def clean_column_names(df: pd.DataFrame) -> pd.DataFrame:
+    """Normalizes column names, removes special chars, handles duplicates."""
+    cleaned_header = []
     seen = {}
-    new_cols = []
-
-    for c in df.columns:
-        c = re.sub(r"\s+", " ", str(c)).strip().title() or "Col"
-        if c in seen:
-            seen[c] += 1
-            new_cols.append(f"{c}_{seen[c]}")
+    
+    for j, h in enumerate(df.columns):
+        # Remove special characters except common structural ones
+        h_clean = re.sub(r'[^a-zA-Z0-9\s_%/.-]', '', str(h)).strip()
+        
+        if not h_clean or h_clean.lower() == 'nan':
+            h_clean = f"Unnamed_{j}"
         else:
-            seen[c] = 0
-            new_cols.append(c)
+            h_clean = re.sub(r'\s+', ' ', h_clean).title()
+            
+        # Standardize common variations
+        h_clean = re.sub(r'Inv\s*No\.?', 'Invoice No', h_clean, flags=re.IGNORECASE)
+        h_clean = re.sub(r'Inv\s*Date', 'Invoice Date', h_clean, flags=re.IGNORECASE)
+        h_clean = re.sub(r'Grn\s*No\.?', 'GRN No', h_clean, flags=re.IGNORECASE)
+        
+        if h_clean in seen:
+            seen[h_clean] += 1
+            h_clean = f"{h_clean}_{seen[h_clean]}"
+        else:
+            seen[h_clean] = 0
+            
+        cleaned_header.append(h_clean)
+        
+    df.columns = cleaned_header
+    return df
 
-    df.columns = new_cols
+def remove_invalid_rows(df: pd.DataFrame) -> pd.DataFrame:
+    """Keeps only rows with numeric values; removes footers, notes, repeated headers."""
+    df = df.dropna(how='all')
+    
+    def is_valid_data(row):
+        row_vals = [str(v).strip() for v in row if pd.notna(v) and str(v).strip() not in ('', 'nan')]
+        if not row_vals:
+            return False
+            
+        # Must have at least 1 numeric value
+        has_numeric = any(bool(re.search(r'\d', v)) for v in row_vals)
+        if not has_numeric:
+            return False
+            
+        # Detect and remove repeated headers buried in the data
+        header_matches = sum(1 for v in row_vals if v.lower() in [str(c).lower() for c in df.columns])
+        if header_matches >= 3:
+            return False
+            
+        return True
+        
+    mask = df.apply(is_valid_data, axis=1)
+    return df[mask].reset_index(drop=True)
 
-    # STEP 7: Remove weak columns
-    df = df.dropna(axis=1, how="all")
-    thresh = int(len(df) * 0.2)
-    df = df.dropna(axis=1, thresh=thresh)
+def clean_tables_v2(df: pd.DataFrame) -> pd.DataFrame:
+    """Master pipeline executing the new modular cleaning steps."""
+    if df is None or df.empty: return pd.DataFrame()
+    df = df.copy()
 
-    # STEP 8: Remove invalid rows
-    df = df[
-        df.apply(
-            lambda row: row.astype(str).str.contains(r"\d").any(),
-            axis=1
-        )
-    ]
+    # 0. Basic string normalization
+    df = df.astype(str).apply(lambda col: col.str.replace(r"\s+", " ", regex=True).str.strip())
+    df = df.replace(r"^\s*$", np.nan, regex=True)
+    df = df.replace(r"^(?i)nan$", np.nan, regex=True)
 
-    # FINAL CLEAN
+    # 1. Detect and Apply Header
+    header_idx = detect_header_row(df)
+    if header_idx != -1:
+        df = apply_header(df, header_idx)
+        df = clean_column_names(df)
+    else:
+        df.columns = [f"Unnamed_{i}" for i in range(len(df.columns))]
+
+    # 2. Filter metadata and noise
+    df = remove_metadata_rows(df)
+    df = remove_noise_columns(df)
+    if df.empty: return pd.DataFrame()
+    
+    # 3. Filter invalid data rows (footers/notes/empty)
+    df = remove_invalid_rows(df)
+    
+    # 4. Final pass
     df = df.drop_duplicates(keep="first")
-    df = df.dropna(axis=0, how="all")
     df = df.reset_index(drop=True)
 
     return df
@@ -684,7 +744,8 @@ def process_single_pdf(filename: str, pdf_bytes: bytes, layout_mode: str) -> Fil
     result.num_tables_found = len(raw_tables)
     merged_tables = group_and_merge_tables(raw_tables)
     
-    cleaned_tables = [clean_tables(df) for df in merged_tables]
+    # Use the upgraded V2 cleaning pipeline
+    cleaned_tables = [clean_tables_v2(df) for df in merged_tables]
     cleaned_tables = [df for df in cleaned_tables if not df.empty]
     
     result.tables = cleaned_tables  # Store for master-excel batching
@@ -865,8 +926,17 @@ def main():
                     master_tables.append(t_copy)
                     
             if master_tables:
-                # Master file is typically best dumped as a single stacked sheet
-                master_excel_bytes, _, _ = build_excel_workbook(master_tables, layout_mode="single")
+                # Upgraded Master Merging:
+                # Use pandas.concat to intelligently merge by standardized column names
+                # This prevents "NaN explosion" from slightly misaligned schemas
+                master_df = pd.concat(master_tables, ignore_index=True, sort=False)
+                
+                # Write the combined DataFrame directly to a single sheet
+                output = io.BytesIO()
+                with pd.ExcelWriter(output, engine="openpyxl") as writer:
+                    master_df.to_excel(writer, sheet_name="Master_Data", index=False)
+                master_excel_bytes = output.getvalue()
+                
                 colB.download_button(
                     label="⬇️ Download ONE Master Excel (All PDFs Combined)",
                     data=master_excel_bytes,
@@ -874,7 +944,7 @@ def main():
                     mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
                     type="secondary",
                     use_container_width=True,
-                    help="Combine every table from every PDF into a single Excel file."
+                    help="Combine every table from every PDF into a single structured Excel dataset."
                 )
 
         st.markdown("#### Individual files")
