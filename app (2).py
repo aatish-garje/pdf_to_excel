@@ -623,7 +623,7 @@ def clean_tables_v2(df: pd.DataFrame) -> pd.DataFrame:
     # 0. Basic string normalization
     df = df.astype(str).apply(lambda col: col.str.replace(r"\s+", " ", regex=True).str.strip())
     df = df.replace(r"^\s*$", np.nan, regex=True)
-    df = df.replace(r"^(?i)nan$", np.nan, regex=True)
+    df = df.replace(r"(?i)^nan$", np.nan, regex=True)
 
     # 1. Detect and Apply Header
     header_idx = detect_header_row(df)
