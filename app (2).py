@@ -208,9 +208,17 @@ def preprocess_image(image: np.ndarray) -> np.ndarray:
     processed = cv2.morphologyEx(thresh, cv2.MORPH_CLOSE, kernel)
     return processed
 
-def _words_to_table(ocr_data: Dict[str, list], y_tolerance: int = 12) -> pd.DataFrame:
+
+def _words_to_table(ocr_data: Dict[str, list]) -> pd.DataFrame:
+    """
+    Reconstruct a pseudo-table from pytesseract's word-level bounding boxes.
+    Uses an X-axis projection histogram to detect absolute column boundaries
+    across the entire page, ensuring empty cells don't shift data leftwards.
+    """
     words = []
     n = len(ocr_data["text"])
+    max_right = 0
+    
     for i in range(n):
         text = ocr_data["text"][i].strip()
         if not text:
@@ -221,39 +229,127 @@ def _words_to_table(ocr_data: Dict[str, list], y_tolerance: int = 12) -> pd.Data
         except (ValueError, TypeError):
             conf_val = -1
         if conf_val != -1 and conf_val < 30:
-            continue
+            continue  # skip very low-confidence noise
+            
+        left = ocr_data["left"][i]
+        top = ocr_data["top"][i]
+        width = ocr_data["width"][i]
+        height = ocr_data["height"][i]
+        right = left + width
+        bottom = top + height
+        
+        if right > max_right:
+            max_right = right
+            
         words.append({
             "text": text,
-            "left": ocr_data["left"][i],
-            "top": ocr_data["top"][i],
+            "left": left,
+            "right": right,
+            "top": top,
+            "bottom": bottom,
+            "center_x": left + (width / 2.0),
+            "center_y": top + (height / 2.0)
         })
 
     if not words:
         return pd.DataFrame()
 
-    words.sort(key=lambda w: w["top"])
+    # 1. Group into rows via dynamic Y tolerance based on text height
+    avg_height = sum(w["bottom"] - w["top"] for w in words) / len(words)
+    dynamic_y_tol = max(avg_height * 0.4, 5) 
+    
+    words.sort(key=lambda w: w["center_y"])
+    
     rows = []
     current_row = [words[0]]
-    current_top = words[0]["top"]
+    current_y = words[0]["center_y"]
 
     for w in words[1:]:
-        if abs(w["top"] - current_top) <= y_tolerance:
+        if abs(w["center_y"] - current_y) <= dynamic_y_tol:
             current_row.append(w)
+            current_y = sum(x["center_y"] for x in current_row) / len(current_row)
         else:
             rows.append(current_row)
             current_row = [w]
-            current_top = w["top"]
-    rows.append(current_row)
+            current_y = w["center_y"]
+    if current_row:
+        rows.append(current_row)
 
+    # 2. X-axis projection to find global column boundaries
+    # Create a 1D array of the page width. Dilate word boxes slightly to merge nearby text.
+    dilation = int(max(avg_height * 0.8, 10)) 
+    x_profile = np.zeros(max_right + dilation + 2)
+    
+    page_width = max_right
+    for w in words:
+        # Ignore extremely wide artifacts (e.g., horizontal lines) for layout planning
+        if w["right"] - w["left"] > page_width * 0.8 and page_width > 100:
+            continue
+            
+        start = max(0, w["left"] - dilation)
+        end = min(len(x_profile) - 1, w["right"] + dilation)
+        x_profile[start:end] = 1
+        
+    # Find contiguous blocks of 1s (these are our established columns)
+    cols = []
+    in_col = False
+    start_idx = 0
+    for i, val in enumerate(x_profile):
+        if val == 1 and not in_col:
+            in_col = True
+            start_idx = i
+        elif val == 0 and in_col:
+            in_col = False
+            cols.append((start_idx, i))
+    if in_col:
+        cols.append((start_idx, len(x_profile)))
+        
+    if not cols:
+        cols = [(0, max_right)]
+
+    # 3. Map words to the detected columns across the grid
     table_rows = []
     for row in rows:
-        row_sorted = sorted(row, key=lambda w: w["left"])
-        table_rows.append([w["text"] for w in row_sorted])
+        row_data = [""] * len(cols)
+        row.sort(key=lambda w: w["left"])
+        
+        for w in row:
+            word_center_x = w["center_x"]
+            assigned_col_idx = -1
+            
+            # First try strict containment within a column
+            for idx, (c_start, c_end) in enumerate(cols):
+                if c_start <= word_center_x <= c_end:
+                    assigned_col_idx = idx
+                    break
+                    
+            # Fallback to closest column if text is slightly misaligned
+            if assigned_col_idx == -1:
+                distances = []
+                for idx, (c_start, c_end) in enumerate(cols):
+                    if word_center_x < c_start:
+                        distances.append((idx, c_start - word_center_x))
+                    else:
+                        distances.append((idx, word_center_x - c_end))
+                assigned_col_idx = min(distances, key=lambda x: x[1])[0]
+            
+            if row_data[assigned_col_idx] == "":
+                row_data[assigned_col_idx] = w["text"]
+            else:
+                row_data[assigned_col_idx] += " " + w["text"]
+                
+        table_rows.append(row_data)
 
-    max_cols = max(len(r) for r in table_rows)
-    table_rows = [r + [""] * (max_cols - len(r)) for r in table_rows]
+    df = pd.DataFrame(table_rows)
+    
+    # Cleanup empty placeholder columns
+    df.replace(r'^\s*$', np.nan, regex=True, inplace=True)
+    df.dropna(how="all", axis=1, inplace=True)
+    df.fillna("", inplace=True)
+    df.columns = [str(i) for i in range(len(df.columns))]
 
-    return pd.DataFrame(table_rows)
+    return df
+
 
 def extract_ocr_pdf(pdf_bytes: bytes, filename: str, dpi: int = 200) -> List[ExtractedTable]:
     extracted: List[ExtractedTable] = []
