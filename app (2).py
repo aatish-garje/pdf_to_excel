@@ -482,8 +482,8 @@ def clean_tables(df: pd.DataFrame) -> pd.DataFrame:
     df = df.copy()
 
     # Normalize all cell text: strip whitespace, collapse internal spaces
-    df = df.applymap(
-        lambda v: re.sub(r"\s+", " ", str(v).strip()) if pd.notna(v) else v
+    df = df.astype(str).apply(
+        lambda col: col.str.replace(r"\s+", " ", regex=True).str.strip()
     )
 
     # Replace empty-string cells with NaN so dropna works correctly
