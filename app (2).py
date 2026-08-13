@@ -212,8 +212,8 @@ def preprocess_image(image: np.ndarray) -> np.ndarray:
 def _words_to_table(ocr_data: Dict[str, list]) -> List[pd.DataFrame]:
     """
     Reconstruct tables from pytesseract's word-level bounding boxes.
-    Uses Block-wise Spatial Projection to handle pages with multiple 
-    differing table layouts (e.g., Header Key-Values vs Main Data Grid).
+    Uses a Global Page Grid Projection to align all text on the page 
+    into a single unified visual master grid (matches exact visual layout).
     """
     words = []
     n = len(ocr_data["text"])
@@ -288,120 +288,96 @@ def _words_to_table(ocr_data: Dict[str, list]) -> List[pd.DataFrame]:
     if current_row:
         rows.append(current_row)
 
-    # 2. Group rows into layout Blocks (Zones) based on vertical spacing
-    # If the gap between lines is significantly large, it's a new table layout.
-    blocks = []
-    current_block = [rows[0]]
+    # 2. Determine Global Columns via X-axis Projection (Ignoring long bridging text)
+    widths = sorted([w["width"] for w in cleaned_words])
+    median_width = widths[len(widths) // 2]
+    page_max_right = max(w["right"] for w in cleaned_words)
     
-    for i in range(1, len(rows)):
-        prev_row = rows[i-1]
-        curr_row = rows[i]
+    x_profile = np.zeros(int(page_max_right) + 5)
+    
+    for w in cleaned_words:
+        # Ignore extremely wide text elements (like page titles) so they don't bridge the vertical gaps
+        if w["width"] > median_width * 5:
+            continue
+        start = int(w["left"])
+        end = int(w["right"])
+        x_profile[start:end] += 1
         
-        prev_y = sum(w["center_y"] for w in prev_row) / len(prev_row)
-        curr_y = sum(w["center_y"] for w in curr_row) / len(curr_row)
-        gap_y = curr_y - prev_y
+    raw_cols = []
+    in_col = False
+    start_idx = 0
+    # A gap is anywhere the vertical density drops to 0
+    for i, val in enumerate(x_profile):
+        if val > 0 and not in_col:
+            in_col = True
+            start_idx = i
+        elif val == 0 and in_col:
+            in_col = False
+            raw_cols.append((start_idx, i))
+    if in_col:
+        raw_cols.append((start_idx, len(x_profile)))
         
-        # A gap larger than ~2.2x font height means a major layout break
-        if gap_y > avg_height * 2.2:
-            blocks.append(current_block)
-            current_block = [curr_row]
+    if not raw_cols:
+        return []
+
+    # 3. Bridge internal small spaces (like spaces within a single column phrase)
+    cols = [raw_cols[0]]
+    for i in range(1, len(raw_cols)):
+        prev_start, prev_end = cols[-1]
+        curr_start, curr_end = raw_cols[i]
+        gap = curr_start - prev_end
+        
+        # If the gap is smaller than roughly the size of a standard space character
+        if gap <= max(avg_height * 0.45, 6):
+            cols[-1] = (prev_start, curr_end)
         else:
-            current_block.append(curr_row)
-            
-    if current_block:
-        blocks.append(current_block)
+            cols.append((curr_start, curr_end))
 
-    # 3. Process each Block independently to find its exact columns
-    dfs = []
-    for block_rows in blocks:
-        block_words = [w for row in block_rows for w in row]
-        if not block_words:
-            continue
-            
-        block_max_right = max(w["right"] for w in block_words)
+    # 4. Map words to the precise Master Columns detected
+    table_rows = []
+    for row in rows:
+        row_data = [""] * len(cols)
+        row.sort(key=lambda w: w["left"])
         
-        # X-axis projection for THIS BLOCK ONLY
-        dilation = int(max(avg_height * 0.25, 2))
-        x_profile = np.zeros(int(block_max_right) + dilation + 2)
-        
-        for w in block_words:
-            start = max(0, w["left"] - dilation)
-            end = min(len(x_profile) - 1, w["right"] + dilation)
-            x_profile[start:end] += 1
+        for w in row:
+            word_center_x = w["center_x"]
+            assigned_col_idx = -1
             
-        raw_cols = []
-        in_col = False
-        start_idx = 0
-        for i, val in enumerate(x_profile):
-            if val > 0 and not in_col:
-                in_col = True
-                start_idx = i
-            elif val == 0 and in_col:
-                in_col = False
-                raw_cols.append((start_idx, i))
-        if in_col:
-            raw_cols.append((start_idx, len(x_profile)))
-            
-        if not raw_cols:
-            continue
-
-        cols = [raw_cols[0]]
-        for i in range(1, len(raw_cols)):
-            prev_start, prev_end = cols[-1]
-            curr_start, curr_end = raw_cols[i]
-            gap = curr_start - prev_end
-            
-            # Bridge internal spaces but preserve true column gaps
-            if gap <= max(avg_height * 0.35, 4):
-                cols[-1] = (prev_start, curr_end)
-            else:
-                cols.append((curr_start, curr_end))
-
-        # 4. Map words to the precise columns detected
-        table_rows = []
-        for row in block_rows:
-            row_data = [""] * len(cols)
-            row.sort(key=lambda w: w["left"])
-            
-            for w in row:
-                word_center_x = w["center_x"]
-                assigned_col_idx = -1
-                
-                # Strict containment
-                for idx, (c_start, c_end) in enumerate(cols):
-                    if c_start <= word_center_x <= c_end:
-                        assigned_col_idx = idx
-                        break
-                        
-                # Closest column fallback
-                if assigned_col_idx == -1:
-                    distances = []
-                    for idx, (c_start, c_end) in enumerate(cols):
-                        if word_center_x < c_start:
-                            distances.append((idx, c_start - word_center_x))
-                        else:
-                            distances.append((idx, word_center_x - c_end))
-                    assigned_col_idx = min(distances, key=lambda x: x[1])[0]
-                
-                if row_data[assigned_col_idx] == "":
-                    row_data[assigned_col_idx] = w["text"]
-                else:
-                    row_data[assigned_col_idx] += " " + w["text"]
+            # Strict containment
+            for idx, (c_start, c_end) in enumerate(cols):
+                if c_start <= word_center_x <= c_end:
+                    assigned_col_idx = idx
+                    break
                     
-            table_rows.append(row_data)
+            # Closest column fallback for misaligned edge characters
+            if assigned_col_idx == -1:
+                distances = []
+                for idx, (c_start, c_end) in enumerate(cols):
+                    if word_center_x < c_start:
+                        distances.append((idx, c_start - word_center_x))
+                    else:
+                        distances.append((idx, word_center_x - c_end))
+                assigned_col_idx = min(distances, key=lambda x: x[1])[0]
+            
+            if row_data[assigned_col_idx] == "":
+                row_data[assigned_col_idx] = w["text"]
+            else:
+                row_data[assigned_col_idx] += " " + w["text"]
+                
+        table_rows.append(row_data)
 
-        df = pd.DataFrame(table_rows)
-        
-        # Cleanup block
-        df.replace(r'^\s*$', np.nan, regex=True, inplace=True)
-        df.dropna(how="all", axis=1, inplace=True)
-        df.fillna("", inplace=True)
-        
-        if not df.empty and len(df.columns) > 0:
-            df.columns = [str(i) for i in range(len(df.columns))]
-            dfs.append(df)
+    df = pd.DataFrame(table_rows)
+    
+    # Cleanup block
+    df.replace(r'^\s*$', np.nan, regex=True, inplace=True)
+    df.dropna(how="all", axis=1, inplace=True) # drop strictly empty columns
+    df.fillna("", inplace=True)
+    
+    if not df.empty and len(df.columns) > 0:
+        df.columns = [str(i) for i in range(len(df.columns))]
+        return [df]
 
-    return dfs
+    return []
 
 
 def extract_ocr_pdf(pdf_bytes: bytes, filename: str, dpi: int = 200) -> List[ExtractedTable]:
@@ -582,6 +558,16 @@ def _safe_sheet_name(name: str, used_names: set) -> str:
     used_names.add(name)
     return name
 
+def _is_dummy_header(columns) -> bool:
+    """Check if the dataframe headers are just auto-generated (col_0, col_1, etc)."""
+    for c in columns:
+        c_str = str(c).lower().strip()
+        if c_str == "source pdf":
+            continue
+        if not re.match(r'^(col_?\d*|\d+|unnamed.*)(_\d+)?$', c_str) and c_str != "":
+            return False
+    return True
+
 def build_excel_workbook(tables: List[pd.DataFrame], layout_mode: str = "multi") -> Tuple[bytes, List[str], Dict[str, pd.DataFrame]]:
     """
     Write a list of cleaned tables into an Excel workbook.
@@ -610,22 +596,23 @@ def build_excel_workbook(tables: List[pd.DataFrame], layout_mode: str = "multi")
                     if current_row == 0:
                         previews[sheet_name] = df.head(5)
                         
-                    # Add a visual separator/label row for clarity between tables
-                    label_df = pd.DataFrame(columns=[f"--- Table {idx+1} ---"])
-                    label_df.to_excel(writer, sheet_name=sheet_name, startrow=current_row, index=False)
+                    # If columns are just "col_1, col_2" etc, do not print them in Excel
+                    write_header = not _is_dummy_header(df.columns)
                     
-                    # Write the actual data underneath
-                    df.to_excel(writer, sheet_name=sheet_name, startrow=current_row + 1, index=False)
+                    df.to_excel(writer, sheet_name=sheet_name, startrow=current_row, index=False, header=write_header)
                     
-                    # Update current_row to position the next table (Data Length + Header + Label + Empty Gap)
-                    current_row += len(df) + 4
+                    # Update current_row to position the next table exactly underneath with 1 gap row
+                    current_row += len(df) + (1 if write_header else 0) + 1
             else:
                 # Traditional Mode: One Table per Sheet
                 for idx, df in enumerate(tables, start=1):
                     if df.empty:
                         continue
                     sheet_name = _safe_sheet_name(f"Table_{idx}", used_names)
-                    df.to_excel(writer, sheet_name=sheet_name, index=False)
+                    
+                    write_header = not _is_dummy_header(df.columns)
+                    df.to_excel(writer, sheet_name=sheet_name, index=False, header=write_header)
+                    
                     sheet_names.append(sheet_name)
                     previews[sheet_name] = df.head(5)
 
