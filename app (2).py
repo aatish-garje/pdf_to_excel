@@ -493,48 +493,94 @@ def group_and_merge_tables(extracted_tables: List[ExtractedTable]) -> List[pd.Da
 # ==================================================================================
 
 def clean_tables(df: pd.DataFrame) -> pd.DataFrame:
-    if df is None or df.empty: return pd.DataFrame()
+    if df is None or df.empty:
+        return pd.DataFrame()
+
     df = df.copy()
 
+    # STEP 1: Normalize text
     df = df.astype(str).apply(lambda col: col.str.replace(r"\s+", " ", regex=True).str.strip())
     df = df.replace(r"^\s*$", np.nan, regex=True)
     df = df.dropna(axis=0, how="all")
     df = df.dropna(axis=1, how="all")
 
-    if df.empty: return df
+    if df.empty:
+        return df
+
     df = df.reset_index(drop=True)
 
-    first_row = df.iloc[0]
-    non_null_ratio = first_row.notna().mean()
-    if non_null_ratio > 0.5:
-        df.columns = [str(c) if pd.notna(c) else f"col_{i}" for i, c in enumerate(first_row)]
-        df = df.iloc[1:].reset_index(drop=True)
-    else:
-        df.columns = [f"col_{i}" for i in range(len(df.columns))]
+    # STEP 2: Remove metadata rows
+    metadata_keywords = ["psf", "plant", "annexure", "gst", "cin"]
 
+    df = df[
+        ~df.apply(
+            lambda row: any(
+                k in " ".join(row.astype(str)).lower()
+                for k in metadata_keywords
+            ),
+            axis=1
+        )
+    ]
+
+    df = df.reset_index(drop=True)
+
+    # STEP 3: Detect header row
+    header_idx = 0
+    for i, row in df.iterrows():
+        text = " ".join(row.astype(str)).lower()
+        if "date" in text and ("invoice" in text or "qty" in text or "value" in text):
+            header_idx = i
+            break
+
+    # STEP 4: Apply header
+    df.columns = [
+        str(c) if pd.notna(c) else f"col_{i}"
+        for i, c in enumerate(df.iloc[header_idx])
+    ]
+    df = df.iloc[header_idx + 1:].reset_index(drop=True)
+
+    # STEP 5: Remove duplicate header rows
+    header_lower = [str(c).strip().lower() for c in df.columns]
+
+    def _is_header_dup(row):
+        vals = [str(v).strip().lower() for v in row.tolist()]
+        n = min(len(vals), len(header_lower))
+        if n == 0:
+            return False
+        return fuzz.ratio(" ".join(vals[:n]), " ".join(header_lower[:n])) >= HEADER_SIMILARITY_THRESHOLD
+
+    if len(df) > 0:
+        df = df[~df.apply(_is_header_dup, axis=1)]
+
+    # STEP 6: Clean column names
     seen = {}
     new_cols = []
+
     for c in df.columns:
-        c = str(c).strip() or "col"
+        c = re.sub(r"\s+", " ", str(c)).strip().title() or "Col"
         if c in seen:
             seen[c] += 1
             new_cols.append(f"{c}_{seen[c]}")
         else:
             seen[c] = 0
             new_cols.append(c)
+
     df.columns = new_cols
 
-    header_lower = [str(c).strip().lower() for c in df.columns]
-    def _is_header_dup(row):
-        vals = [str(v).strip().lower() for v in row.tolist()]
-        n = min(len(vals), len(header_lower))
-        if n == 0: return False
-        return fuzz.ratio(" ".join(vals[:n]), " ".join(header_lower[:n])) >= HEADER_SIMILARITY_THRESHOLD
+    # STEP 7: Remove weak columns
+    df = df.dropna(axis=1, how="all")
+    thresh = int(len(df) * 0.2)
+    df = df.dropna(axis=1, thresh=thresh)
 
-    if len(df) > 0:
-        dup_mask = df.apply(_is_header_dup, axis=1)
-        df = df[~dup_mask]
+    # STEP 8: Remove invalid rows
+    df = df[
+        df.apply(
+            lambda row: row.astype(str).str.contains(r"\d").any(),
+            axis=1
+        )
+    ]
 
+    # FINAL CLEAN
     df = df.drop_duplicates(keep="first")
     df = df.dropna(axis=0, how="all")
     df = df.reset_index(drop=True)
