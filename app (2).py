@@ -208,16 +208,9 @@ def preprocess_image(image: np.ndarray) -> np.ndarray:
     processed = cv2.morphologyEx(thresh, cv2.MORPH_CLOSE, kernel)
     return processed
 
-
-def _words_to_table(ocr_data: Dict[str, list]) -> List[pd.DataFrame]:
-    """
-    Reconstruct tables from pytesseract's word-level bounding boxes.
-    Uses a Global Page Grid Projection to align all text on the page 
-    into a single unified visual master grid (matches exact visual layout).
-    """
+def _words_to_table(ocr_data: Dict[str, list], y_tolerance: int = 12) -> pd.DataFrame:
     words = []
     n = len(ocr_data["text"])
-    
     for i in range(n):
         text = ocr_data["text"][i].strip()
         if not text:
@@ -228,157 +221,39 @@ def _words_to_table(ocr_data: Dict[str, list]) -> List[pd.DataFrame]:
         except (ValueError, TypeError):
             conf_val = -1
         if conf_val != -1 and conf_val < 30:
-            continue  # skip very low-confidence noise
-            
-        left = ocr_data["left"][i]
-        top = ocr_data["top"][i]
-        width = ocr_data["width"][i]
-        height = ocr_data["height"][i]
-            
+            continue
         words.append({
             "text": text,
-            "left": left,
-            "right": left + width,
-            "top": top,
-            "bottom": top + height,
-            "center_x": left + (width / 2.0),
-            "center_y": top + (height / 2.0),
-            "width": width,
-            "height": height
+            "left": ocr_data["left"][i],
+            "top": ocr_data["top"][i],
         })
 
     if not words:
-        return []
+        return pd.DataFrame()
 
-    # Filter out purely structural grid characters
-    data_words = [w for w in words if not re.fullmatch(r'[|_\-]', w["text"])]
-    if not data_words:
-        data_words = words
-
-    # Filter out extreme outliers (like QR codes or noise)
-    heights = sorted([w["height"] for w in data_words])
-    median_height = heights[len(heights) // 2]
-    
-    cleaned_words = []
-    for w in data_words:
-        if 0.4 * median_height <= w["height"] <= 3.5 * median_height:
-            cleaned_words.append(w)
-            
-    if not cleaned_words:
-        cleaned_words = data_words
-
-    # 1. Group into rows via dynamic Y tolerance
-    avg_height = sum(w["height"] for w in cleaned_words) / len(cleaned_words)
-    dynamic_y_tol = max(avg_height * 0.4, 4) 
-    
-    cleaned_words.sort(key=lambda w: w["center_y"])
-    
+    words.sort(key=lambda w: w["top"])
     rows = []
-    current_row = [cleaned_words[0]]
-    current_y = cleaned_words[0]["center_y"]
+    current_row = [words[0]]
+    current_top = words[0]["top"]
 
-    for w in cleaned_words[1:]:
-        if abs(w["center_y"] - current_y) <= dynamic_y_tol:
+    for w in words[1:]:
+        if abs(w["top"] - current_top) <= y_tolerance:
             current_row.append(w)
-            current_y = sum(x["center_y"] for x in current_row) / len(current_row)
         else:
             rows.append(current_row)
             current_row = [w]
-            current_y = w["center_y"]
-    if current_row:
-        rows.append(current_row)
+            current_top = w["top"]
+    rows.append(current_row)
 
-    # 2. Determine Global Columns via X-axis Projection (Ignoring long bridging text)
-    widths = sorted([w["width"] for w in cleaned_words])
-    median_width = widths[len(widths) // 2]
-    page_max_right = max(w["right"] for w in cleaned_words)
-    
-    x_profile = np.zeros(int(page_max_right) + 5)
-    
-    for w in cleaned_words:
-        # Ignore extremely wide text elements (like page titles) so they don't bridge the vertical gaps
-        if w["width"] > median_width * 5:
-            continue
-        start = int(w["left"])
-        end = int(w["right"])
-        x_profile[start:end] += 1
-        
-    raw_cols = []
-    in_col = False
-    start_idx = 0
-    # A gap is anywhere the vertical density drops to 0
-    for i, val in enumerate(x_profile):
-        if val > 0 and not in_col:
-            in_col = True
-            start_idx = i
-        elif val == 0 and in_col:
-            in_col = False
-            raw_cols.append((start_idx, i))
-    if in_col:
-        raw_cols.append((start_idx, len(x_profile)))
-        
-    if not raw_cols:
-        return []
-
-    # 3. Bridge internal small spaces (like spaces within a single column phrase)
-    cols = [raw_cols[0]]
-    for i in range(1, len(raw_cols)):
-        prev_start, prev_end = cols[-1]
-        curr_start, curr_end = raw_cols[i]
-        gap = curr_start - prev_end
-        
-        # If the gap is smaller than roughly the size of a standard space character
-        if gap <= max(avg_height * 0.45, 6):
-            cols[-1] = (prev_start, curr_end)
-        else:
-            cols.append((curr_start, curr_end))
-
-    # 4. Map words to the precise Master Columns detected
     table_rows = []
     for row in rows:
-        row_data = [""] * len(cols)
-        row.sort(key=lambda w: w["left"])
-        
-        for w in row:
-            word_center_x = w["center_x"]
-            assigned_col_idx = -1
-            
-            # Strict containment
-            for idx, (c_start, c_end) in enumerate(cols):
-                if c_start <= word_center_x <= c_end:
-                    assigned_col_idx = idx
-                    break
-                    
-            # Closest column fallback for misaligned edge characters
-            if assigned_col_idx == -1:
-                distances = []
-                for idx, (c_start, c_end) in enumerate(cols):
-                    if word_center_x < c_start:
-                        distances.append((idx, c_start - word_center_x))
-                    else:
-                        distances.append((idx, word_center_x - c_end))
-                assigned_col_idx = min(distances, key=lambda x: x[1])[0]
-            
-            if row_data[assigned_col_idx] == "":
-                row_data[assigned_col_idx] = w["text"]
-            else:
-                row_data[assigned_col_idx] += " " + w["text"]
-                
-        table_rows.append(row_data)
+        row_sorted = sorted(row, key=lambda w: w["left"])
+        table_rows.append([w["text"] for w in row_sorted])
 
-    df = pd.DataFrame(table_rows)
-    
-    # Cleanup block
-    df.replace(r'^\s*$', np.nan, regex=True, inplace=True)
-    df.dropna(how="all", axis=1, inplace=True) # drop strictly empty columns
-    df.fillna("", inplace=True)
-    
-    if not df.empty and len(df.columns) > 0:
-        df.columns = [str(i) for i in range(len(df.columns))]
-        return [df]
+    max_cols = max(len(r) for r in table_rows)
+    table_rows = [r + [""] * (max_cols - len(r)) for r in table_rows]
 
-    return []
-
+    return pd.DataFrame(table_rows)
 
 def extract_ocr_pdf(pdf_bytes: bytes, filename: str, dpi: int = 200) -> List[ExtractedTable]:
     extracted: List[ExtractedTable] = []
@@ -391,16 +266,12 @@ def extract_ocr_pdf(pdf_bytes: bytes, filename: str, dpi: int = 200) -> List[Ext
         try:
             img = np.array(pil_page.convert("RGB"))
             processed = preprocess_image(img)
-            
             ocr_data = pytesseract.image_to_data(
-                processed, output_type=pytesseract.Output.DICT, config="--psm 6"
+                processed, output_type=pytesseract.Output.DICT
             )
-            
-            # Map each block layout into its own standalone table mapping
-            dfs = _words_to_table(ocr_data)
-            for df in dfs:
-                if not df.empty:
-                    extracted.append(ExtractedTable(df, i, "ocr"))
+            df = _words_to_table(ocr_data)
+            if not df.empty:
+                extracted.append(ExtractedTable(df, i, "ocr"))
         except Exception:
             continue
 
@@ -489,160 +360,54 @@ def group_and_merge_tables(extracted_tables: List[ExtractedTable]) -> List[pd.Da
 
 
 # ==================================================================================
-# STEP 4: DATA CLEANING & POST-PROCESSING
+# STEP 4: DATA CLEANING
 # ==================================================================================
 
-def detect_header_row(df: pd.DataFrame) -> int:
-    """Finds the row containing business keywords. Does not assume first row."""
-    keywords = {"date", "invoice", "qty", "quantity", "value", "tax", "amount", "price", "net", "sgst", "cgst", "igst"}
-    best_row_idx = -1
-    max_score = 0
-    
-    # Scan top 20 rows
-    for i in range(min(20, len(df))):
-        row_vals = [str(v).lower().strip() for v in df.iloc[i].values if pd.notna(v) and str(v).strip() not in ('', 'nan')]
-        score = sum(1 for v in row_vals if any(kw in v for kw in keywords))
-        
-        if score > max_score and score >= 2: 
-            max_score = score
-            best_row_idx = i
-            
-    return best_row_idx
-
-def apply_header(df: pd.DataFrame, header_idx: int) -> pd.DataFrame:
-    """Sets the detected row as df.columns and removes all rows above it."""
-    if header_idx == -1:
-        return df
-        
-    header_row = df.iloc[header_idx].astype(str).tolist()
-    df.columns = header_row
-    
-    # Drop everything above and including the header
-    df = df.iloc[header_idx+1:].reset_index(drop=True)
-    return df
-
-def remove_metadata_rows(df: pd.DataFrame) -> pd.DataFrame:
-    """Removes rows containing metadata keywords."""
-    metadata_keywords = {"psf", "plant", "annexure", "gst", "cin", "effective from", "effective to"}
-    
-    def is_metadata(row):
-        text = " ".join([str(v).lower() for v in row if pd.notna(v)])
-        return any(kw in text for kw in metadata_keywords)
-        
-    mask = df.apply(is_metadata, axis=1)
-    return df[~mask].reset_index(drop=True)
-
-def remove_noise_columns(df: pd.DataFrame) -> pd.DataFrame:
-    """Drops columns that are fully empty, >80% empty, or contain no numeric data/meaningful text."""
-    df = df.replace(r"(?i)^\s*nan\s*$", np.nan, regex=True)
-    df = df.replace(r"^\s*$", np.nan, regex=True)
-    
-    # Drop fully empty
-    df = df.dropna(axis=1, how="all")
-    if df.empty:
-        return df
-        
-    # Drop >80% empty
-    min_non_na = int(len(df) * 0.2) 
-    if min_non_na > 0:
-        df = df.dropna(axis=1, thresh=min_non_na)
-        
-    cols_to_keep = []
-    for col in df.columns:
-        vals = df[col].dropna().astype(str)
-        if len(vals) == 0:
-            continue
-            
-        has_numeric = vals.str.contains(r'\d').any()
-        is_only_punctuation = all(re.fullmatch(r'[^a-zA-Z0-9]', v) for v in vals)
-        
-        if has_numeric or not is_only_punctuation:
-            cols_to_keep.append(col)
-            
-    return df[cols_to_keep]
-
-def clean_column_names(df: pd.DataFrame) -> pd.DataFrame:
-    """Normalizes column names, removes special chars, handles duplicates."""
-    cleaned_header = []
-    seen = {}
-    
-    for j, h in enumerate(df.columns):
-        # Remove special characters except common structural ones
-        h_clean = re.sub(r'[^a-zA-Z0-9\s_%/.-]', '', str(h)).strip()
-        
-        if not h_clean or h_clean.lower() == 'nan':
-            h_clean = f"Unnamed_{j}"
-        else:
-            h_clean = re.sub(r'\s+', ' ', h_clean).title()
-            
-        # Standardize common variations
-        h_clean = re.sub(r'Inv\s*No\.?', 'Invoice No', h_clean, flags=re.IGNORECASE)
-        h_clean = re.sub(r'Inv\s*Date', 'Invoice Date', h_clean, flags=re.IGNORECASE)
-        h_clean = re.sub(r'Grn\s*No\.?', 'GRN No', h_clean, flags=re.IGNORECASE)
-        
-        if h_clean in seen:
-            seen[h_clean] += 1
-            h_clean = f"{h_clean}_{seen[h_clean]}"
-        else:
-            seen[h_clean] = 0
-            
-        cleaned_header.append(h_clean)
-        
-    df.columns = cleaned_header
-    return df
-
-def remove_invalid_rows(df: pd.DataFrame) -> pd.DataFrame:
-    """Keeps only rows with numeric values; removes footers, notes, repeated headers."""
-    df = df.dropna(how='all')
-    
-    def is_valid_data(row):
-        row_vals = [str(v).strip() for v in row if pd.notna(v) and str(v).strip() not in ('', 'nan')]
-        if not row_vals:
-            return False
-            
-        # Must have at least 1 numeric value
-        has_numeric = any(bool(re.search(r'\d', v)) for v in row_vals)
-        if not has_numeric:
-            return False
-            
-        # Detect and remove repeated headers buried in the data
-        header_matches = sum(1 for v in row_vals if v.lower() in [str(c).lower() for c in df.columns])
-        if header_matches >= 3:
-            return False
-            
-        return True
-        
-    mask = df.apply(is_valid_data, axis=1)
-    return df[mask].reset_index(drop=True)
-
-def clean_tables_v2(df: pd.DataFrame) -> pd.DataFrame:
-    """Master pipeline executing the new modular cleaning steps."""
+def clean_tables(df: pd.DataFrame) -> pd.DataFrame:
     if df is None or df.empty: return pd.DataFrame()
     df = df.copy()
 
-    # 0. Basic string normalization
     df = df.astype(str).apply(lambda col: col.str.replace(r"\s+", " ", regex=True).str.strip())
     df = df.replace(r"^\s*$", np.nan, regex=True)
-    df = df.replace(r"(?i)^nan$", np.nan, regex=True)
+    df = df.dropna(axis=0, how="all")
+    df = df.dropna(axis=1, how="all")
 
-    # 1. Detect and Apply Header
-    header_idx = detect_header_row(df)
-    if header_idx != -1:
-        df = apply_header(df, header_idx)
-        df = clean_column_names(df)
+    if df.empty: return df
+    df = df.reset_index(drop=True)
+
+    first_row = df.iloc[0]
+    non_null_ratio = first_row.notna().mean()
+    if non_null_ratio > 0.5:
+        df.columns = [str(c) if pd.notna(c) else f"col_{i}" for i, c in enumerate(first_row)]
+        df = df.iloc[1:].reset_index(drop=True)
     else:
-        df.columns = [f"Unnamed_{i}" for i in range(len(df.columns))]
+        df.columns = [f"col_{i}" for i in range(len(df.columns))]
 
-    # 2. Filter metadata and noise
-    df = remove_metadata_rows(df)
-    df = remove_noise_columns(df)
-    if df.empty: return pd.DataFrame()
-    
-    # 3. Filter invalid data rows (footers/notes/empty)
-    df = remove_invalid_rows(df)
-    
-    # 4. Final pass
+    seen = {}
+    new_cols = []
+    for c in df.columns:
+        c = str(c).strip() or "col"
+        if c in seen:
+            seen[c] += 1
+            new_cols.append(f"{c}_{seen[c]}")
+        else:
+            seen[c] = 0
+            new_cols.append(c)
+    df.columns = new_cols
+
+    header_lower = [str(c).strip().lower() for c in df.columns]
+    def _is_header_dup(row):
+        vals = [str(v).strip().lower() for v in row.tolist()]
+        n = min(len(vals), len(header_lower))
+        if n == 0: return False
+        return fuzz.ratio(" ".join(vals[:n]), " ".join(header_lower[:n])) >= HEADER_SIMILARITY_THRESHOLD
+
+    if len(df) > 0:
+        dup_mask = df.apply(_is_header_dup, axis=1)
+        df = df[~dup_mask]
+
     df = df.drop_duplicates(keep="first")
+    df = df.dropna(axis=0, how="all")
     df = df.reset_index(drop=True)
 
     return df
@@ -663,16 +428,6 @@ def _safe_sheet_name(name: str, used_names: set) -> str:
         counter += 1
     used_names.add(name)
     return name
-
-def _is_dummy_header(columns) -> bool:
-    """Check if the dataframe headers are just auto-generated (col_0, col_1, etc)."""
-    for c in columns:
-        c_str = str(c).lower().strip()
-        if c_str == "source pdf":
-            continue
-        if not re.match(r'^(col_?\d*|\d+|unnamed.*)(_\d+)?$', c_str) and c_str != "":
-            return False
-    return True
 
 def build_excel_workbook(tables: List[pd.DataFrame], layout_mode: str = "multi") -> Tuple[bytes, List[str], Dict[str, pd.DataFrame]]:
     """
@@ -702,23 +457,22 @@ def build_excel_workbook(tables: List[pd.DataFrame], layout_mode: str = "multi")
                     if current_row == 0:
                         previews[sheet_name] = df.head(5)
                         
-                    # If columns are just "col_1, col_2" etc, do not print them in Excel
-                    write_header = not _is_dummy_header(df.columns)
+                    # Add a visual separator/label row for clarity between tables
+                    label_df = pd.DataFrame(columns=[f"--- Table {idx+1} ---"])
+                    label_df.to_excel(writer, sheet_name=sheet_name, startrow=current_row, index=False)
                     
-                    df.to_excel(writer, sheet_name=sheet_name, startrow=current_row, index=False, header=write_header)
+                    # Write the actual data underneath
+                    df.to_excel(writer, sheet_name=sheet_name, startrow=current_row + 1, index=False)
                     
-                    # Update current_row to position the next table exactly underneath with 1 gap row
-                    current_row += len(df) + (1 if write_header else 0) + 1
+                    # Update current_row to position the next table (Data Length + Header + Label + Empty Gap)
+                    current_row += len(df) + 4
             else:
                 # Traditional Mode: One Table per Sheet
                 for idx, df in enumerate(tables, start=1):
                     if df.empty:
                         continue
                     sheet_name = _safe_sheet_name(f"Table_{idx}", used_names)
-                    
-                    write_header = not _is_dummy_header(df.columns)
-                    df.to_excel(writer, sheet_name=sheet_name, index=False, header=write_header)
-                    
+                    df.to_excel(writer, sheet_name=sheet_name, index=False)
                     sheet_names.append(sheet_name)
                     previews[sheet_name] = df.head(5)
 
@@ -744,8 +498,7 @@ def process_single_pdf(filename: str, pdf_bytes: bytes, layout_mode: str) -> Fil
     result.num_tables_found = len(raw_tables)
     merged_tables = group_and_merge_tables(raw_tables)
     
-    # Use the upgraded V2 cleaning pipeline
-    cleaned_tables = [clean_tables_v2(df) for df in merged_tables]
+    cleaned_tables = [clean_tables(df) for df in merged_tables]
     cleaned_tables = [df for df in cleaned_tables if not df.empty]
     
     result.tables = cleaned_tables  # Store for master-excel batching
@@ -926,17 +679,8 @@ def main():
                     master_tables.append(t_copy)
                     
             if master_tables:
-                # Upgraded Master Merging:
-                # Use pandas.concat to intelligently merge by standardized column names
-                # This prevents "NaN explosion" from slightly misaligned schemas
-                master_df = pd.concat(master_tables, ignore_index=True, sort=False)
-                
-                # Write the combined DataFrame directly to a single sheet
-                output = io.BytesIO()
-                with pd.ExcelWriter(output, engine="openpyxl") as writer:
-                    master_df.to_excel(writer, sheet_name="Master_Data", index=False)
-                master_excel_bytes = output.getvalue()
-                
+                # Master file is typically best dumped as a single stacked sheet
+                master_excel_bytes, _, _ = build_excel_workbook(master_tables, layout_mode="single")
                 colB.download_button(
                     label="⬇️ Download ONE Master Excel (All PDFs Combined)",
                     data=master_excel_bytes,
@@ -944,7 +688,7 @@ def main():
                     mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
                     type="secondary",
                     use_container_width=True,
-                    help="Combine every table from every PDF into a single structured Excel dataset."
+                    help="Combine every table from every PDF into a single Excel file."
                 )
 
         st.markdown("#### Individual files")
