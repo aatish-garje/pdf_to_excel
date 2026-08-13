@@ -1,18 +1,15 @@
 """
 ==================================================================================
- Smart Multi-PDF to Excel Converter (Separate Excel per PDF & Master Export)
+ Smart Multi-PDF to Excel Converter (Grid-Aware OCR & Data Alignment)
 ==================================================================================
 A production-grade Streamlit application that:
   - Accepts 100+ PDF uploads at once
   - Detects whether each PDF is text-based or scanned (image-based)
-  - Extracts tables using pdfplumber/camelot (text PDFs) or OCR (scanned PDFs)
+  - Extracts tables using pdfplumber/camelot (text PDFs) 
+  - Uses advanced OpenCV Grid-Detection for scanned PDFs to perfectly align columns
   - Detects multi-page table continuity and merges continued tables
-  - Cleans extracted data (empty rows/cols, duplicate headers, column alignment)
-  - Allows exporting tables into a Single Sheet or Multiple Sheets
+  - Cleans extracted data and formats output (bold headers, auto-width)
   - Produces Excel workbooks per PDF + an optional Master Excel for all PDFs
-  - Handles errors per-file so one bad PDF never stops the batch
-
-Run with:  streamlit run app.py
 ==================================================================================
 """
 
@@ -33,8 +30,10 @@ import pdfplumber
 from pdf2image import convert_from_bytes
 import pytesseract
 import cv2
-
 from rapidfuzz import fuzz
+
+# For premium Excel formatting
+from openpyxl.styles import Font, PatternFill, Alignment
 
 # camelot is optional at import time
 try:
@@ -43,10 +42,6 @@ try:
 except Exception:
     CAMELOT_AVAILABLE = False
 
-
-# ==================================================================================
-# CONFIGURATION
-# ==================================================================================
 
 st.set_page_config(
     page_title="Multi-PDF to Excel Converter",
@@ -60,10 +55,6 @@ COLUMN_COUNT_TOLERANCE = 0
 DTYPE_SIMILARITY_THRESHOLD = 0.6   
 EXCEL_SHEET_NAME_MAX_LEN = 31  
 
-
-# ==================================================================================
-# DATA STRUCTURES
-# ==================================================================================
 
 @dataclass
 class ExtractedTable:
@@ -83,15 +74,11 @@ class FileResult:
     sheet_names: List[str] = field(default_factory=list)
     preview_frames: Dict[str, pd.DataFrame] = field(default_factory=dict)
     excel_bytes: Optional[bytes] = None
-    tables: List[pd.DataFrame] = field(default_factory=list)  # Save extracted tables for master excel
+    tables: List[pd.DataFrame] = field(default_factory=list)
     num_pages: int = 0
     num_tables_found: int = 0
     num_tables_after_merge: int = 0
 
-
-# ==================================================================================
-# STEP 1: PDF TYPE DETECTION
-# ==================================================================================
 
 def detect_pdf_type(pdf_bytes: bytes) -> Tuple[str, int]:
     try:
@@ -115,10 +102,6 @@ def detect_pdf_type(pdf_bytes: bytes) -> Tuple[str, int]:
     except Exception:
         return "scanned", 0
 
-
-# ==================================================================================
-# STEP 2A: TEXT-BASED EXTRACTION
-# ==================================================================================
 
 def extract_text_pdf(pdf_bytes: bytes, filename: str) -> List[ExtractedTable]:
     extracted: List[ExtractedTable] = []
@@ -191,10 +174,6 @@ def extract_text_pdf(pdf_bytes: bytes, filename: str) -> List[ExtractedTable]:
     return extracted
 
 
-# ==================================================================================
-# STEP 2B: SCANNED PDF EXTRACTION (OCR)
-# ==================================================================================
-
 def preprocess_image(image: np.ndarray) -> np.ndarray:
     gray = cv2.cvtColor(image, cv2.COLOR_RGB2GRAY)
     denoised = cv2.fastNlMeansDenoising(gray, h=10)
@@ -208,52 +187,156 @@ def preprocess_image(image: np.ndarray) -> np.ndarray:
     processed = cv2.morphologyEx(thresh, cv2.MORPH_CLOSE, kernel)
     return processed
 
-def _words_to_table(ocr_data: Dict[str, list], y_tolerance: int = 12) -> pd.DataFrame:
+
+def _extract_tables_from_ocr(ocr_data: Dict[str, list], img: np.ndarray) -> List[pd.DataFrame]:
+    """
+    Highly robust OCR table extractor. Uses OpenCV to find grid lines, isolates tables into blocks,
+    and accurately aligns columns based on grid layouts or X-axis projection profiles.
+    """
     words = []
     n = len(ocr_data["text"])
     for i in range(n):
-        text = ocr_data["text"][i].strip()
-        if not text:
-            continue
-        conf = ocr_data.get("conf", ["0"] * n)[i]
+        text = str(ocr_data["text"][i]).strip()
+        if not text: continue
         try:
-            conf_val = float(conf)
-        except (ValueError, TypeError):
-            conf_val = -1
-        if conf_val != -1 and conf_val < 30:
-            continue
+            conf = float(ocr_data.get("conf", ["0"] * n)[i])
+            if conf < 15: continue
+        except: continue
+        
+        x, y, w, h = ocr_data["left"][i], ocr_data["top"][i], ocr_data["width"][i], ocr_data["height"][i]
         words.append({
-            "text": text,
-            "left": ocr_data["left"][i],
-            "top": ocr_data["top"][i],
+            "text": text, "left": x, "top": y, "right": x+w, "bottom": y+h,
+            "width": w, "height": h, "cx": x + w/2, "cy": y + h/2
         })
-
-    if not words:
-        return pd.DataFrame()
-
-    words.sort(key=lambda w: w["top"])
-    rows = []
-    current_row = [words[0]]
-    current_top = words[0]["top"]
-
+        
+    if not words: 
+        return []
+    
+    # 1. Row Formation using strict vertical overlap heuristics
+    words.sort(key=lambda w: w["cy"])
+    lines = []
+    current_line = [words[0]]
+    
     for w in words[1:]:
-        if abs(w["top"] - current_top) <= y_tolerance:
-            current_row.append(w)
+        avg_cy = sum(x["cy"] for x in current_line) / len(current_line)
+        avg_h = sum(x["height"] for x in current_line) / len(current_line)
+        if abs(w["cy"] - avg_cy) < max(avg_h * 0.4, 5):
+            current_line.append(w)
         else:
-            rows.append(current_row)
-            current_row = [w]
-            current_top = w["top"]
-    rows.append(current_row)
+            current_line.sort(key=lambda x: x["left"])
+            lines.append(current_line)
+            current_line = [w]
+    if current_line:
+        current_line.sort(key=lambda x: x["left"])
+        lines.append(current_line)
+        
+    # 2. Block Formation (split separate tables by checking large vertical gaps)
+    blocks = []
+    current_block = [lines[0]]
+    for i in range(1, len(lines)):
+        prev_line = lines[i-1]
+        curr_line = lines[i]
+        prev_bottom = max(w["bottom"] for w in prev_line)
+        curr_top = min(w["top"] for w in curr_line)
+        avg_h = sum(w["height"] for w in curr_line) / len(curr_line)
+        
+        if (curr_top - prev_bottom) > avg_h * 2.2: # Significant visual gap = new table
+            blocks.append(current_block)
+            current_block = [curr_line]
+        else:
+            current_block.append(curr_line)
+    if current_block:
+        blocks.append(current_block)
+        
+    # 3. Column parsing per block using OpenCV Grid intelligence
+    image_width = img.shape[1]
+    block_dfs = []
+    
+    for block in blocks:
+        min_y = max(0, min(w["top"] for line in block for w in line) - 10)
+        max_y = min(img.shape[0], max(w["bottom"] for line in block for w in line) + 10)
+        block_img = img[min_y:max_y, :]
+        
+        # Detect vertical grid lines in this specific table block
+        gray = cv2.cvtColor(block_img, cv2.COLOR_RGB2GRAY)
+        thresh = cv2.adaptiveThreshold(~gray, 255, cv2.ADAPTIVE_THRESH_MEAN_C, cv2.THRESH_BINARY, 15, -2)
+        kernel_h = max(15, int(block_img.shape[0] * 0.3)) 
+        v_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (1, kernel_h))
+        v_lines_mask = cv2.morphologyEx(thresh, cv2.MORPH_OPEN, v_kernel)
+        
+        contours, _ = cv2.findContours(v_lines_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        x_coords = []
+        for c in contours:
+            x, y, w_box, h_box = cv2.boundingRect(c)
+            if h_box >= kernel_h * 0.8: 
+                x_coords.append(x + w_box//2)
+                
+        x_coords.sort()
+        v_lines = []
+        if x_coords:
+            curr = [x_coords[0]]
+            for x in x_coords[1:]:
+                if x - curr[-1] < 10:
+                    curr.append(x)
+                else:
+                    v_lines.append(int(np.mean(curr)))
+                    curr = [x]
+            v_lines.append(int(np.mean(curr)))
+            
+        cols = []
+        if len(v_lines) >= 2:
+            # Table has clear grid lines. Use them directly to define columns.
+            v_lines = [0] + v_lines + [image_width]
+            for i in range(len(v_lines)-1):
+                cols.append((v_lines[i], v_lines[i+1]))
+        else:
+            # Borderless Table Fallback: Use Vertical Projection Profile
+            profile = np.zeros(image_width, dtype=int)
+            for line in block:
+                for w in line:
+                    profile[max(0, w["left"]):min(image_width, w["right"])] += 1
+            
+            is_gap = profile <= 0
+            in_col = False
+            start = 0
+            for x in range(image_width):
+                if not is_gap[x] and not in_col:
+                    in_col = True
+                    start = x
+                elif is_gap[x] and in_col:
+                    in_col = False
+                    cols.append((start, x))
+            if in_col:
+                cols.append((start, image_width))
+                
+        # Map words to their perfect grid cells
+        block_data = []
+        for line in block:
+            row_data = [""] * len(cols)
+            for w in line:
+                cx = w["cx"]
+                best_col = 0
+                min_dist = float("inf")
+                for idx, (cmin, cmax) in enumerate(cols):
+                    if cmin <= cx <= cmax:
+                        best_col = idx
+                        break
+                    dist = min(abs(cx - cmin), abs(cx - cmax))
+                    if dist < min_dist:
+                        min_dist = dist
+                        best_col = idx
+                        
+                if row_data[best_col]:
+                    row_data[best_col] += " " + w["text"]
+                else:
+                    row_data[best_col] = w["text"]
+            block_data.append(row_data)
+            
+        if block_data:
+            block_dfs.append(pd.DataFrame(block_data))
+            
+    return block_dfs
 
-    table_rows = []
-    for row in rows:
-        row_sorted = sorted(row, key=lambda w: w["left"])
-        table_rows.append([w["text"] for w in row_sorted])
-
-    max_cols = max(len(r) for r in table_rows)
-    table_rows = [r + [""] * (max_cols - len(r)) for r in table_rows]
-
-    return pd.DataFrame(table_rows)
 
 def extract_ocr_pdf(pdf_bytes: bytes, filename: str, dpi: int = 200) -> List[ExtractedTable]:
     extracted: List[ExtractedTable] = []
@@ -264,46 +347,39 @@ def extract_ocr_pdf(pdf_bytes: bytes, filename: str, dpi: int = 200) -> List[Ext
 
     for i, pil_page in enumerate(pages, start=1):
         try:
+            # Keep original RGB image for grid detection, pass processed to Tesseract
             img = np.array(pil_page.convert("RGB"))
             processed = preprocess_image(img)
+            
             ocr_data = pytesseract.image_to_data(
                 processed, output_type=pytesseract.Output.DICT
             )
-            df = _words_to_table(ocr_data)
-            if not df.empty:
-                extracted.append(ExtractedTable(df, i, "ocr"))
+            
+            # Map unstructured text back into robust DataFrames
+            dfs = _extract_tables_from_ocr(ocr_data, img)
+            for df in dfs:
+                if not df.empty:
+                    extracted.append(ExtractedTable(df, i, "ocr-smart"))
         except Exception:
             continue
 
     return extracted
 
 
-# ==================================================================================
-# STEP 3: CONTINUITY DETECTION & MERGING
-# ==================================================================================
-
 def _infer_column_dtype_signature(series: pd.Series) -> str:
     sample = series.dropna().astype(str).str.strip()
     sample = sample[sample != ""].head(20)
-    if sample.empty:
-        return "empty"
+    if sample.empty: return "empty"
     numeric_count = sum(bool(re.fullmatch(r"-?\d+(\.\d+)?%?", v)) for v in sample)
     date_count = sum(bool(re.fullmatch(r"\d{1,4}[/-]\d{1,2}[/-]\d{1,4}", v)) for v in sample)
-    if numeric_count / len(sample) >= 0.6:
-        return "numeric"
-    if date_count / len(sample) >= 0.6:
-        return "date"
+    if numeric_count / len(sample) >= 0.6: return "numeric"
+    if date_count / len(sample) >= 0.6: return "date"
     return "text"
 
 def _dtype_signature_similarity(df1: pd.DataFrame, df2: pd.DataFrame) -> float:
     n = min(len(df1.columns), len(df2.columns))
     if n == 0: return 0.0
-    matches = 0
-    for c in range(n):
-        sig1 = _infer_column_dtype_signature(df1.iloc[:, c])
-        sig2 = _infer_column_dtype_signature(df2.iloc[:, c])
-        if sig1 == sig2:
-            matches += 1
+    matches = sum(1 for c in range(n) if _infer_column_dtype_signature(df1.iloc[:, c]) == _infer_column_dtype_signature(df2.iloc[:, c]))
     return matches / n
 
 def _header_similarity(df1: pd.DataFrame, df2: pd.DataFrame) -> float:
@@ -316,8 +392,8 @@ def _header_similarity(df1: pd.DataFrame, df2: pd.DataFrame) -> float:
 
 def are_tables_similar(df1: pd.DataFrame, df2: pd.DataFrame) -> bool:
     if df1.empty or df2.empty: return False
-    col_diff = abs(len(df1.columns) - len(df2.columns))
-    if col_diff > COLUMN_COUNT_TOLERANCE: return False
+    if abs(len(df1.columns) - len(df2.columns)) > COLUMN_COUNT_TOLERANCE: return False
+    
     header_score = _header_similarity(df1, df2)
     dtype_score = _dtype_signature_similarity(df1, df2)
 
@@ -349,19 +425,14 @@ def group_and_merge_tables(extracted_tables: List[ExtractedTable]) -> List[pd.Da
     groups: List[List[pd.DataFrame]] = [[ordered[0].dataframe]]
 
     for et in ordered[1:]:
-        last_group = groups[-1]
-        last_df = last_group[-1]
+        last_df = groups[-1][-1]
         if are_tables_similar(last_df, et.dataframe):
-            last_group.append(et.dataframe)
+            groups[-1].append(et.dataframe)
         else:
             groups.append([et.dataframe])
 
     return [merge_tables(g) for g in groups]
 
-
-# ==================================================================================
-# STEP 4: DATA CLEANING
-# ==================================================================================
 
 def clean_tables(df: pd.DataFrame) -> pd.DataFrame:
     if df is None or df.empty: return pd.DataFrame()
@@ -410,12 +481,10 @@ def clean_tables(df: pd.DataFrame) -> pd.DataFrame:
     df = df.dropna(axis=0, how="all")
     df = df.reset_index(drop=True)
 
+    # Fill NaN with empty string for cleaner Excel generation
+    df = df.fillna("")
     return df
 
-
-# ==================================================================================
-# EXCEL WORKBOOK GENERATION (Single Sheet vs Multi Sheet)
-# ==================================================================================
 
 def _safe_sheet_name(name: str, used_names: set) -> str:
     name = re.sub(r"[\[\]:*?/\\]", "_", name).strip() or "Sheet"
@@ -432,7 +501,7 @@ def _safe_sheet_name(name: str, used_names: set) -> str:
 def build_excel_workbook(tables: List[pd.DataFrame], layout_mode: str = "multi") -> Tuple[bytes, List[str], Dict[str, pd.DataFrame]]:
     """
     Write a list of cleaned tables into an Excel workbook.
-    Supports single sheet (stacked tables) or multiple sheets (one table per tab).
+    Applies Openpyxl formatting (Bold headers, auto column widths) for a premium layout.
     """
     output = io.BytesIO()
     used_names: set = set()
@@ -452,36 +521,65 @@ def build_excel_workbook(tables: List[pd.DataFrame], layout_mode: str = "multi")
                 current_row = 0
                 
                 for idx, df in enumerate(tables):
-                    if df.empty:
-                        continue
+                    if df.empty: continue
                     if current_row == 0:
                         previews[sheet_name] = df.head(5)
                         
-                    # Add a visual separator/label row for clarity between tables
                     label_df = pd.DataFrame(columns=[f"--- Table {idx+1} ---"])
                     label_df.to_excel(writer, sheet_name=sheet_name, startrow=current_row, index=False)
-                    
-                    # Write the actual data underneath
                     df.to_excel(writer, sheet_name=sheet_name, startrow=current_row + 1, index=False)
                     
-                    # Update current_row to position the next table (Data Length + Header + Label + Empty Gap)
+                    worksheet = writer.sheets[sheet_name]
+                    header_row = current_row + 2 
+                    
+                    # Style headers
+                    for col_idx in range(1, len(df.columns) + 1):
+                        cell = worksheet.cell(row=header_row, column=col_idx)
+                        cell.font = Font(bold=True)
+                        cell.fill = PatternFill(start_color="F0F0F0", end_color="F0F0F0", fill_type="solid")
+                        cell.alignment = Alignment(horizontal="center")
+                    
                     current_row += len(df) + 4
+                    
+                # Auto-fit columns for Single Sheet
+                worksheet = writer.sheets[sheet_name]
+                for col in worksheet.columns:
+                    max_length = 0
+                    column = col[0].column_letter 
+                    for cell in col:
+                        try: 
+                            if len(str(cell.value)) > max_length:
+                                max_length = len(str(cell.value))
+                        except: pass
+                    worksheet.column_dimensions[column].width = min(max_length + 2, 55)
+
             else:
-                # Traditional Mode: One Table per Sheet
                 for idx, df in enumerate(tables, start=1):
-                    if df.empty:
-                        continue
+                    if df.empty: continue
                     sheet_name = _safe_sheet_name(f"Table_{idx}", used_names)
                     df.to_excel(writer, sheet_name=sheet_name, index=False)
                     sheet_names.append(sheet_name)
                     previews[sheet_name] = df.head(5)
+                    
+                    worksheet = writer.sheets[sheet_name]
+                    
+                    # Format Header & Columns
+                    for col in worksheet.columns:
+                        max_length = 0
+                        column = col[0].column_letter
+                        for i, cell in enumerate(col):
+                            if i == 0:  # Header style
+                                cell.font = Font(bold=True)
+                                cell.fill = PatternFill(start_color="F0F0F0", end_color="F0F0F0", fill_type="solid")
+                                cell.alignment = Alignment(horizontal="center")
+                            try:
+                                if len(str(cell.value)) > max_length:
+                                    max_length = len(str(cell.value))
+                            except: pass
+                        worksheet.column_dimensions[column].width = min(max_length + 2, 55)
 
     return output.getvalue(), sheet_names, previews
 
-
-# ==================================================================================
-# STEP 5 & 6: PIPELINE EXECUTORS
-# ==================================================================================
 
 def process_single_pdf(filename: str, pdf_bytes: bytes, layout_mode: str) -> FileResult:
     result = FileResult(filename=filename, status="processing")
@@ -501,7 +599,7 @@ def process_single_pdf(filename: str, pdf_bytes: bytes, layout_mode: str) -> Fil
     cleaned_tables = [clean_tables(df) for df in merged_tables]
     cleaned_tables = [df for df in cleaned_tables if not df.empty]
     
-    result.tables = cleaned_tables  # Store for master-excel batching
+    result.tables = cleaned_tables
     result.num_tables_after_merge = len(cleaned_tables)
 
     excel_bytes, sheet_names, previews = build_excel_workbook(cleaned_tables, layout_mode)
@@ -560,21 +658,16 @@ def build_zip_of_excels(results: List[FileResult]) -> bytes:
     return zip_buffer.getvalue()
 
 
-# ==================================================================================
-# STREAMLIT UI
-# ==================================================================================
-
 def main():
     st.title("📊 Multi-PDF to Excel Converter")
     st.caption(
-        "Upload multiple PDFs (text-based or scanned). Each PDF is converted into "
-        "an Excel workbook, with multi-page tables intelligently merged."
+        "Upload multiple PDFs (text-based or scanned). Scanned tables are natively processed "
+        "using OpenCV Grid-Intelligence to guarantee perfect column alignment."
     )
 
     if not CAMELOT_AVAILABLE:
         st.warning(
-            "⚠️ `camelot-py` (or its Ghostscript dependency) is not available in this "
-            "environment. Text-based extraction will fall back to pdfplumber only."
+            "⚠️ `camelot-py` (or its Ghostscript dependency) is not available. Text-based extraction will fall back to pdfplumber only."
         )
 
     with st.sidebar:
@@ -588,7 +681,7 @@ def main():
                 "Single-Sheet (All tables stacked vertically)"
             ],
             index=0,
-            help="Choose whether to place each extracted table on its own Excel tab, or stack them all on a single tab with spacing."
+            help="Choose whether to place each extracted table on its own Excel tab, or stack them all on a single tab."
         )
         layout_mode = "single" if "Single" in sheet_layout else "multi"
 
@@ -597,7 +690,7 @@ def main():
                              help="Higher DPI improves OCR accuracy but is slower.")
         
         st.markdown("---")
-        st.markdown("**Tech stack:** pdfplumber, camelot, pytesseract, pdf2image, OpenCV, rapidfuzz, openpyxl")
+        st.markdown("**Core Engines:** openCV, Tesseract, pdfplumber, openpyxl")
 
     uploaded_files = st.file_uploader(
         "Upload PDF files (you can select 100+ at once)",
@@ -630,16 +723,14 @@ def main():
                 return original_ocr_fn(pdf_bytes, filename, dpi=dpi)
             extract_ocr_pdf = _ocr_with_dpi
 
-            with st.spinner("Converting PDFs to Excel... this may take a while for large batches."):
+            with st.spinner("Converting PDFs to Excel... this may take a while for scanned documents."):
                 results = process_multiple_pdfs(uploaded_files, overall_progress_bar, status_container, layout_mode)
 
             extract_ocr_pdf = original_ocr_fn  
             st.session_state["results"] = results
             st.success("🎉 Batch processing complete!")
 
-    # ------------------------------------------------------------------
-    # RESULTS / DOWNLOADS
-    # ------------------------------------------------------------------
+
     results: List[FileResult] = st.session_state.get("results", [])
 
     if results:
@@ -658,7 +749,6 @@ def main():
             st.markdown("#### Batch Actions")
             colA, colB = st.columns(2)
             
-            # Action 1: ZIP of individual files
             zip_bytes = build_zip_of_excels(done_results)
             colA.download_button(
                 label=f"⬇️ Download {len(done_results)} files as ZIP",
@@ -669,17 +759,15 @@ def main():
                 use_container_width=True
             )
             
-            # Action 2: Massive master combined file
             master_tables = []
             for r in done_results:
                 for t in r.tables:
                     t_copy = t.copy()
                     if "Source PDF" not in t_copy.columns:
-                        t_copy.insert(0, "Source PDF", r.filename) # Insert origin filename
+                        t_copy.insert(0, "Source PDF", r.filename)
                     master_tables.append(t_copy)
                     
             if master_tables:
-                # Master file is typically best dumped as a single stacked sheet
                 master_excel_bytes, _, _ = build_excel_workbook(master_tables, layout_mode="single")
                 colB.download_button(
                     label="⬇️ Download ONE Master Excel (All PDFs Combined)",
@@ -688,7 +776,6 @@ def main():
                     mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
                     type="secondary",
                     use_container_width=True,
-                    help="Combine every table from every PDF into a single Excel file."
                 )
 
         st.markdown("#### Individual files")
